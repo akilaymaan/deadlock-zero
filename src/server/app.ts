@@ -56,6 +56,7 @@ export interface ServerOptions {
 
 export interface StartServerOptions extends ServerOptions {
   readonly port?: number;
+  readonly host?: string;
 }
 
 interface ParsedTraceEvent {
@@ -962,8 +963,14 @@ function metricComparison(before: number, after: number): MetricComparison {
   };
 }
 
+function configuredWorkerCount(): number {
+  const parsed = Number.parseInt(process.env.SIMULATION_WORKERS ?? String(DEFAULT_WORKER_COUNT), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WORKER_COUNT;
+}
+
 function benchmarkScenario(scenario: IncidentScenario): BenchmarkComparison {
-  const options = { workerCount: DEFAULT_WORKER_COUNT } as const;
+  const workerCount = configuredWorkerCount();
+  const options = { workerCount } as const;
   const before = simulateScenario(scenario, { ...options, patched: false });
   const after = simulateScenario(scenario, { ...options, patched: true });
   const comparison = {
@@ -979,8 +986,8 @@ function benchmarkScenario(scenario: IncidentScenario): BenchmarkComparison {
   return {
     scenarioId: scenario.id,
     scenarioName: scenario.title,
-    workerCount: DEFAULT_WORKER_COUNT,
-    workers: DEFAULT_WORKER_COUNT,
+    workerCount,
+    workers: workerCount,
     before,
     after,
     comparison,
@@ -1007,10 +1014,20 @@ function configuredPort(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3000;
 }
 
+function configuredHost(): string {
+  const raw = process.env.HOST?.trim();
+  return raw !== undefined && raw.length > 0 ? raw : '0.0.0.0';
+}
+
 function frontendDirectory(options: ServerOptions): string {
   if (options.staticDir !== undefined) return resolve(options.staticDir);
   const currentDirectory = resolve(fileURLToPath(new URL('.', import.meta.url)));
   return resolve(currentDirectory, '../../dist');
+}
+
+function fallbackIndexHtmlPath(): string {
+  const currentDirectory = resolve(fileURLToPath(new URL('.', import.meta.url)));
+  return resolve(currentDirectory, '../../index.html');
 }
 
 class HttpError extends Error {
@@ -1034,13 +1051,14 @@ function sendError(response: Response, error: unknown): void {
 }
 
 function healthPayload(staticDir: string): JsonRecord {
+  const workerCount = configuredWorkerCount();
   const metrics = {
     presetScenarios: INCIDENT_PRESETS.length,
     scenarioCount: INCIDENT_PRESETS.length,
-    defaultWorkerCount: DEFAULT_WORKER_COUNT,
+    defaultWorkerCount: workerCount,
     detectorCount: 2,
     detectors: ['deadlock-cycles', 'vector-clock-races'],
-    staticFrontendAvailable: existsSync(staticDir),
+    staticFrontendAvailable: existsSync(staticDir) || existsSync(fallbackIndexHtmlPath()),
   };
   return {
     status: 'ok',
@@ -1093,12 +1111,13 @@ export function createApp(options: ServerOptions = {}): Express {
         });
         return;
       }
+      const workerCount = configuredWorkerCount();
       response.status(200).json({
         benchmarks: result.benchmarks,
         comparisons: result.benchmarks,
         count: result.benchmarks.length,
-        workerCount: DEFAULT_WORKER_COUNT,
-        workers: DEFAULT_WORKER_COUNT,
+        workerCount,
+        workers: workerCount,
       });
     } catch (error) {
       sendError(response, error);
@@ -1111,12 +1130,19 @@ export function createApp(options: ServerOptions = {}): Express {
 
   if (existsSync(staticDir)) {
     app.use(express.static(staticDir));
+  }
+
+  const indexHtmlPath = existsSync(resolve(staticDir, 'index.html'))
+    ? resolve(staticDir, 'index.html')
+    : fallbackIndexHtmlPath();
+
+  if (existsSync(indexHtmlPath)) {
     app.use((request, response, next) => {
       if (request.method !== 'GET' || request.path.startsWith('/api/')) {
         next();
         return;
       }
-      response.sendFile(resolve(staticDir, 'index.html'), (error) => {
+      response.sendFile(indexHtmlPath, (error) => {
         if (error && !response.headersSent) next(error);
       });
     });
@@ -1142,12 +1168,13 @@ export function createApp(options: ServerOptions = {}): Express {
 /** Start the HTTP server on PORT or 3000. */
 export function startServer(options: StartServerOptions = {}): Server {
   const port = options.port ?? configuredPort();
+  const host = options.host ?? configuredHost();
   const app = createApp(options);
   const server = createServer(app);
-  server.listen(port, () => {
+  server.listen(port, host, () => {
     const address = server.address();
     const actualPort = typeof address === 'object' && address !== null ? address.port : port;
-    console.log(`DeadlockZero server listening on http://localhost:${actualPort}`);
+    console.log(`DeadlockZero server listening on http://${host}:${actualPort}`);
   });
   return server;
 }

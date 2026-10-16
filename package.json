@@ -4,12 +4,15 @@
   "version": "0.1.0",
   "type": "module",
   "engines": {
-    "node": "22.19.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "dev": "vite",
     "dev:server": "tsx src/server/index.ts",
-    "build": "tsc --noEmit && vite build",
+    "build:backend": "tsc --noEmit",
+    "build:frontend": "vite build",
+    "build": "npm run build:backend && npm run build:frontend",
+    "start": "tsx src/server/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview"
