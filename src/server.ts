@@ -1,19 +1,11 @@
-import { createServer } from 'node:http';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { startServer } from './server/index';
 
-const configuredPort = Number.parseInt(process.env.PORT ?? '3000', 10);
-const port = Number.isNaN(configuredPort) ? 3000 : configuredPort;
+export * from './server/index';
 
-const server = createServer((request, response) => {
-  if (request.url === '/health') {
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ status: 'ok' }));
-    return;
-  }
-
-  response.writeHead(404, { 'content-type': 'application/json' });
-  response.end(JSON.stringify({ error: 'Not found' }));
-});
-
-server.listen(port, () => {
-  console.log(`DeadlockZero server listening on http://localhost:${port}`);
-});
+// Keep the original `tsx src/server.ts` entry point working while the actual
+// Express implementation lives under src/server/.
+if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  startServer();
+}

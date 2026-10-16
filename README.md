@@ -15,13 +15,22 @@ npm install
 npm run dev
 ```
 
-Run the minimal Node.js health endpoint separately:
+Run the Express API and production frontend server separately:
 
 ```bash
 npm run dev:server
 ```
 
-The health endpoint is available at `http://localhost:3000/health`.
+The server listens on `http://localhost:3000` by default, or on `process.env.PORT`.
+After `npm run build`, it serves the Vite production build at `/` and exposes:
+
+- `GET /api/health` — engine status and detector metrics.
+- `GET /api/scenarios` — the five built-in outage scenarios.
+- `POST /api/analyze` — analyze a preset ID or custom lock-event JSON/log trace.
+- `POST /api/benchmark` — compare the 500-worker before/after replay.
+
+The API app factory is exported from `src/server/` for integration tests and other
+Node.js consumers.
 
 ## Checks
 
