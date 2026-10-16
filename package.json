@@ -18,17 +18,24 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "cors": "^2.8.6",
     "express": "^5.3.0",
+    "lucide-react": "^1.58.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^22.15.0",
     "@types/react": "^19.1.0",
     "@types/react-dom": "^19.1.0",
+    "@types/supertest": "^7.2.1",
     "@vitejs/plugin-react": "^4.4.1",
+    "autoprefixer": "^10.6.1",
+    "postcss": "^8.5.30",
+    "supertest": "^7.3.1",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3",

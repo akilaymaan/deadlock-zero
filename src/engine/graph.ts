@@ -1,3 +1,19 @@
+import type {
+  BuiltWaitForGraph,
+  GraphEdge,
+  GraphNode,
+  LockEvent,
+  WaitForAdjacencyHop,
+} from '../shared/types';
+
+export type {
+  BuiltWaitForGraph,
+  GraphEdge,
+  GraphNode,
+  LockEvent,
+  WaitForAdjacencyHop,
+} from '../shared/types';
+
 export type GraphId = string;
 export type AcquisitionTimestamp = number;
 
@@ -290,3 +306,153 @@ export class WaitForGraph {
     }
   }
 }
+
+export interface WaitForGraphBuildResult extends BuiltWaitForGraph, WaitForGraphSnapshot {}
+
+/**
+ * Build a Wait-For Graph (WFG) from a sequence of LockEvent records.
+ * Produces GraphNode[], GraphEdge[] (HOLDS and WAITS_FOR), and worker-to-worker
+ * Wait-For adjacency lists alongside a WaitForGraphSnapshot.
+ */
+export function buildWaitForGraph(events: readonly LockEvent[]): WaitForGraphBuildResult {
+  const workerSet = new Set<string>();
+  const resourceSet = new Set<string>();
+  const currentHolderByResource = new Map<string, LockEvent>();
+  const activeWaits: LockEvent[] = [];
+
+  for (const event of events) {
+    if (event.workerId) workerSet.add(event.workerId);
+    if (event.resourceId && (event.action === 'ACQUIRE' || event.action === 'WAIT' || event.action === 'RELEASE')) {
+      resourceSet.add(event.resourceId);
+    }
+
+    if (event.action === 'ACQUIRE') {
+      currentHolderByResource.set(event.resourceId, event);
+      // If this worker was previously waiting on this resource, clear that wait
+      for (let i = activeWaits.length - 1; i >= 0; i -= 1) {
+        if (activeWaits[i].workerId === event.workerId && activeWaits[i].resourceId === event.resourceId) {
+          activeWaits.splice(i, 1);
+        }
+      }
+    } else if (event.action === 'RELEASE') {
+      const holder = currentHolderByResource.get(event.resourceId);
+      if (!holder || holder.workerId === event.workerId) {
+        currentHolderByResource.delete(event.resourceId);
+      }
+    } else if (event.action === 'WAIT') {
+      activeWaits.push(event);
+    }
+  }
+
+  // Ensure any resource referenced only in READ/WRITE is also represented if no lock events exist
+  if (resourceSet.size === 0) {
+    for (const event of events) {
+      if (event.resourceId) resourceSet.add(event.resourceId);
+    }
+  }
+
+  const nodes: GraphNode[] = [
+    ...[...workerSet].map(
+      (id): GraphNode => ({
+        id,
+        label: id,
+        type: 'WORKER',
+        inCycle: false,
+      }),
+    ),
+    ...[...resourceSet].map(
+      (id): GraphNode => ({
+        id,
+        label: id,
+        type: 'RESOURCE',
+        inCycle: false,
+      }),
+    ),
+  ];
+
+  const edges: GraphEdge[] = [];
+  for (const [resourceId, holdEvent] of currentHolderByResource.entries()) {
+    edges.push({
+      from: resourceId,
+      to: holdEvent.workerId,
+      relation: 'HOLDS',
+      file: holdEvent.file,
+      line: holdEvent.line,
+      inCycle: false,
+      resourceId,
+      codeSnippet: holdEvent.codeSnippet,
+    });
+  }
+
+  const adjacency: Record<string, string[]> = {};
+  for (const workerId of workerSet) {
+    adjacency[workerId] = [];
+  }
+
+  const hops: WaitForAdjacencyHop[] = [];
+  const wfg = new WaitForGraph();
+  for (const workerId of workerSet) {
+    wfg.addThread({ id: workerId, name: workerId });
+  }
+  for (const resourceId of resourceSet) {
+    wfg.addLock({ id: resourceId, name: resourceId });
+  }
+  for (const [resourceId, holdEvent] of currentHolderByResource.entries()) {
+    wfg.recordAcquisition({
+      resourceId,
+      holderId: holdEvent.workerId,
+      acquiredAt: Math.max(0, holdEvent.timestamp),
+      source: holdEvent.file && holdEvent.line >= 1 ? { file: holdEvent.file, line: holdEvent.line } : undefined,
+    });
+  }
+
+  let waitIdx = 0;
+  for (const waitEvent of activeWaits) {
+    edges.push({
+      from: waitEvent.workerId,
+      to: waitEvent.resourceId,
+      relation: 'WAITS_FOR',
+      file: waitEvent.file,
+      line: waitEvent.line,
+      inCycle: false,
+      resourceId: waitEvent.resourceId,
+      codeSnippet: waitEvent.codeSnippet,
+    });
+
+    const holdEvent = currentHolderByResource.get(waitEvent.resourceId);
+    if (holdEvent && holdEvent.workerId !== waitEvent.workerId) {
+      const list = adjacency[waitEvent.workerId] ?? [];
+      if (!list.includes(holdEvent.workerId)) {
+        list.push(holdEvent.workerId);
+      }
+      adjacency[waitEvent.workerId] = list;
+      hops.push({
+        fromWorker: waitEvent.workerId,
+        toWorker: holdEvent.workerId,
+        resourceId: waitEvent.resourceId,
+        waitEvent,
+        holdEvent,
+      });
+
+      wfg.addWaitForEdge({
+        id: `${waitEvent.id || 'wait'}-${waitIdx++}:${waitEvent.workerId}->${holdEvent.workerId}:${waitEvent.resourceId}`,
+        waiterId: waitEvent.workerId,
+        holderId: holdEvent.workerId,
+        resourceId: waitEvent.resourceId,
+        observedAt: Math.max(0, waitEvent.timestamp),
+        source: waitEvent.file && waitEvent.line >= 1 ? { file: waitEvent.file, line: waitEvent.line } : undefined,
+      });
+    }
+  }
+
+  const snapshot = wfg.toJSON();
+  return {
+    nodes,
+    edges,
+    adjacency,
+    hops,
+    events: [...events],
+    ...snapshot,
+  };
+}
+
