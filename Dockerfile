@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- Build stage: install all dependencies, verify, and build ----
-FROM node:22.19.0-bookworm-slim AS build
+FROM node:26.11.1-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json .nvmrc ./
 RUN npm ci
@@ -9,7 +9,7 @@ COPY . .
 RUN npm test && npm run build
 
 # ---- Runtime stage: production dependencies and built output only ----
-FROM node:22.19.0-bookworm-slim AS runtime
+FROM node:26.11.1-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     PORT=3000 \
     HOST=0.0.0.0
