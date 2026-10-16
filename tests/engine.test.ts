@@ -4,15 +4,17 @@ import { detectDeadlocks } from '../src/engine/deadlockDetector';
 import { detectRaces, detectStarvation } from '../src/engine/raceDetector';
 import { generateRemediationPlan } from '../src/engine/remediator';
 import { runChaosBenchmark } from '../src/engine/simulator';
-import { getScenarioPreset, INCIDENT_PRESETS } from '../src/scenarios/presets';
-import type { LockEvent } from '../src/shared/types';
+import {
+  ABBA_DEADLOCK_TRACE,
+  CANONICAL_SAFE_TRACE,
+  POOL_STARVATION_TRACE,
+  THREE_NODE_DEADLOCK_TRACE,
+  VECTOR_CLOCK_RACE_TRACE,
+} from './fixtures/traces';
 
 describe('DeadlockZero Engine — Tarjan SCC, Vector Clocks & 500-Worker Chaos Simulator', () => {
-  it('detects a 2-node AB-BA deadlock cycle using Tarjan SCC on payment-abba-deadlock', () => {
-    const preset = getScenarioPreset('payment-abba-deadlock');
-    expect(preset).toBeDefined();
-
-    const graph = buildWaitForGraph(preset.events);
+  it('detects a 2-node AB-BA deadlock cycle using Tarjan SCC', () => {
+    const graph = buildWaitForGraph(ABBA_DEADLOCK_TRACE);
     const cycles = detectDeadlocks(graph);
 
     expect(cycles).toHaveLength(1);
@@ -29,9 +31,8 @@ describe('DeadlockZero Engine — Tarjan SCC, Vector Clocks & 500-Worker Chaos S
     expect(graph.edges.every((e) => e.inCycle)).toBe(true);
   });
 
-  it('detects a 3-node circular RPC deadlock cycle on microservice-circular-rpc', () => {
-    const preset = getScenarioPreset('microservice-circular-rpc');
-    const graph = buildWaitForGraph(preset.events);
+  it('detects a 3-node circular RPC deadlock cycle', () => {
+    const graph = buildWaitForGraph(THREE_NODE_DEADLOCK_TRACE);
     const cycles = detectDeadlocks(graph);
 
     expect(cycles).toHaveLength(1);
@@ -45,52 +46,15 @@ describe('DeadlockZero Engine — Tarjan SCC, Vector Clocks & 500-Worker Chaos S
   });
 
   it('verifies cycle-free canonical lock hierarchies produce zero deadlocks', () => {
-    const canonicalEvents: LockEvent[] = [
-      {
-        id: 'c1',
-        workerId: 'Worker_1',
-        resourceId: 'Account_A',
-        action: 'ACQUIRE',
-        timestamp: 10,
-        vectorClock: { Worker_1: 1, Worker_2: 0 },
-        file: 'src/services/ledger.ts',
-        line: 41,
-        codeSnippet: 'await tx.acquireRowLock("Account_A");',
-      },
-      {
-        id: 'c2',
-        workerId: 'Worker_1',
-        resourceId: 'Account_B',
-        action: 'ACQUIRE',
-        timestamp: 12,
-        vectorClock: { Worker_1: 2, Worker_2: 0 },
-        file: 'src/services/ledger.ts',
-        line: 42,
-        codeSnippet: 'await tx.acquireRowLock("Account_B");',
-      },
-      {
-        id: 'c3',
-        workerId: 'Worker_2',
-        resourceId: 'Account_A',
-        action: 'WAIT',
-        timestamp: 15,
-        vectorClock: { Worker_1: 0, Worker_2: 1 },
-        file: 'src/services/ledger.ts',
-        line: 41,
-        codeSnippet: 'await tx.acquireRowLock("Account_A");',
-      },
-    ];
-
-    const graph = buildWaitForGraph(canonicalEvents);
+    const graph = buildWaitForGraph(CANONICAL_SAFE_TRACE);
     const cycles = detectDeadlocks(graph);
 
     expect(cycles).toHaveLength(0);
     expect(graph.nodes.some((n) => n.inCycle)).toBe(false);
   });
 
-  it('detects concurrent Lamport vector-clock conflicts on inventory-double-spend', () => {
-    const preset = getScenarioPreset('inventory-double-spend');
-    const races = detectRaces(preset.events);
+  it('detects concurrent Lamport vector-clock conflicts', () => {
+    const races = detectRaces(VECTOR_CLOCK_RACE_TRACE);
 
     expect(races.length).toBeGreaterThan(0);
     const writeWriteRace = races.find(
@@ -102,21 +66,25 @@ describe('DeadlockZero Engine — Tarjan SCC, Vector Clocks & 500-Worker Chaos S
     expect(writeWriteRace?.vectorClockB).toEqual({ w1: 1, w2: 2 });
   });
 
-  it('detects connection pool starvation when >80% of workers block in WAIT on db-pool-starvation', () => {
-    const preset = getScenarioPreset('db-pool-starvation');
-    const starvation = detectStarvation(preset.events);
+  it('detects connection pool starvation when >80% of workers block in WAIT', () => {
+    const starvation = detectStarvation(POOL_STARVATION_TRACE);
 
     expect(starvation.length).toBeGreaterThan(0);
     expect(starvation[0].poolId).toBe('pg_tx_pool');
     expect(starvation[0].queued).toBeGreaterThanOrEqual(5);
   });
 
-  it('runs deterministic 500-worker chaos simulations and generates remediation plans across all 5 presets', () => {
-    expect(INCIDENT_PRESETS).toHaveLength(5);
+  it('runs deterministic 500-worker chaos simulations and generates remediation plans', () => {
+    const traces = [
+      ABBA_DEADLOCK_TRACE,
+      THREE_NODE_DEADLOCK_TRACE,
+      VECTOR_CLOCK_RACE_TRACE,
+      POOL_STARVATION_TRACE,
+    ];
 
-    for (const preset of INCIDENT_PRESETS) {
-      const run1 = runChaosBenchmark(preset.events, 500);
-      const run2 = runChaosBenchmark(preset.events, 500);
+    for (const trace of traces) {
+      const run1 = runChaosBenchmark(trace, 500);
+      const run2 = runChaosBenchmark(trace, 500);
 
       expect(run1).toEqual(run2);
       expect(run1.before.workers).toBe(500);
@@ -128,7 +96,7 @@ describe('DeadlockZero Engine — Tarjan SCC, Vector Clocks & 500-Worker Chaos S
       expect(run1.after.successRatePct).toBe(100);
       expect(run1.improvementFactor).toBeGreaterThan(10);
 
-      const plan = generateRemediationPlan(preset);
+      const plan = generateRemediationPlan(trace);
       expect(plan.unifiedDiff).toContain('--- a/');
       expect(plan.unifiedDiff).toContain('+++ b/');
       expect(plan.runbookMarkdown).toContain('3 a.m. Outage Runbook Checklist');

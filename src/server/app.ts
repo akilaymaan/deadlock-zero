@@ -10,52 +10,31 @@ import {
 } from '../engine/deadlockDetector';
 import {
   buildWaitForGraph,
-  WaitForGraph,
-  type ExecutionNode,
   type LockEvent,
-  type ResourceNode,
   type SourceCodeReference,
   type WaitForGraphSnapshot,
 } from '../engine/graph';
 import {
-  analyzeRaceTrace,
   detectRaces,
   detectStarvation,
   type RaceAnalysis,
-  type RaceAnalysisInput,
 } from '../engine/raceDetector';
 import {
   generateRemediationPlan,
-  remediateScenario,
   type RemediationResult,
 } from '../engine/remediator';
 import {
   DEFAULT_WORKER_COUNT,
   runChaosBenchmark,
-  simulateScenario,
   type SimulationMetrics,
-  type SimulationResult,
 } from '../engine/simulator';
-import {
-  getScenarioPreset,
-  INCIDENT_PRESETS,
-  type IncidentScenario,
-} from '../scenarios/presets';
 
-const SERVER_VERSION = '0.1.0';
-const JSON_BODY_LIMIT = '2mb';
+const SERVER_VERSION = '1.0.0';
+const JSON_BODY_LIMIT = '5mb';
+
+const VALID_ACTIONS = new Set(['ACQUIRE', 'WAIT', 'RELEASE', 'READ', 'WRITE']);
 
 type JsonRecord = Record<string, unknown>;
-type TraceOperation =
-  | 'acquire'
-  | 'release'
-  | 'wait'
-  | 'access'
-  | 'fork'
-  | 'join'
-  | 'sync'
-  | 'pool'
-  | undefined;
 
 export interface ServerOptions {
   /** Override the frontend build directory, primarily useful for integration tests. */
@@ -67,27 +46,15 @@ export interface StartServerOptions extends ServerOptions {
   readonly host?: string;
 }
 
-interface ParsedTraceEvent {
-  readonly operation: Exclude<TraceOperation, undefined>;
-  readonly threadId?: string;
-  readonly holderId?: string;
-  readonly resourceId?: string;
-  readonly eventId: string;
-  readonly observedAt: number;
-  readonly source?: SourceCodeReference;
-  readonly raw: JsonRecord;
-}
-
-interface AnalysisSource {
-  readonly kind: 'preset' | 'custom';
-  readonly scenarioId: string;
-  readonly scenarioName: string;
+export interface ValidationIssue {
+  readonly index?: number;
+  readonly field: string;
+  readonly message: string;
 }
 
 interface AnalysisResponse {
-  readonly source: AnalysisSource;
-  readonly scenario: unknown;
   readonly events: readonly LockEvent[];
+  readonly sourceCode?: string;
   readonly graph: WaitForGraphSnapshot & {
     readonly nodes: readonly unknown[];
     readonly edges: readonly unknown[];
@@ -116,1034 +83,265 @@ interface AnalysisResponse {
   readonly runbookMarkdown: string;
 }
 
-interface BenchmarkComparison {
-  readonly scenarioId: string;
-  readonly scenarioName: string;
-  readonly workerCount: number;
-  readonly workers: number;
-  readonly before: SimulationResult & SimulationMetrics;
-  readonly after: SimulationResult & SimulationMetrics;
-  readonly improvementFactor: number;
-  readonly comparison: {
-    readonly throughputRps: MetricComparison;
-    readonly latencyMs: {
-      readonly p50: MetricComparison;
-      readonly p95: MetricComparison;
-      readonly p99: MetricComparison;
-    };
-    readonly deadlocks: MetricComparison;
-    readonly droppedRequests: MetricComparison;
-  };
-  readonly metrics: BenchmarkComparison['comparison'];
-}
-
-interface MetricComparison {
-  readonly before: number;
-  readonly after: number;
-  readonly delta: number;
-  readonly improvementFactor: number | null;
-}
-
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function firstDefined(record: JsonRecord, names: readonly string[]): unknown {
-  for (const name of names) {
-    if (record[name] !== undefined) return record[name];
-  }
-  return undefined;
-}
-
-function stringValue(value: unknown): string | undefined {
-  if (typeof value === 'string' && value.trim().length > 0) return value.trim();
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  return undefined;
-}
-
-function identifierValue(value: unknown): string | undefined {
-  if (isRecord(value)) {
-    return stringValue(firstDefined(value, ['id', 'name', 'key', 'label', 'threadId', 'resourceId']));
-  }
-  return stringValue(value);
-}
-
-function requiredIdentifier(record: JsonRecord, names: readonly string[], context: string): string {
-  const value = identifierValue(firstDefined(record, names));
-  if (value === undefined) throw new Error(`${context} is required`);
-  return value;
-}
-
-function normalizeToken(value: unknown): string {
-  return typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s_-]+/g, '') : '';
-}
-
-function sourceFromRecord(record: JsonRecord, context: string): SourceCodeReference | undefined {
-  const sourceValue = firstDefined(record, ['source', 'sourceLocation']);
-  if (sourceValue !== undefined) {
-    if (!isRecord(sourceValue)) throw new Error(`${context}.source must be an object`);
-    const file = stringValue(sourceValue.file);
-    const line = sourceValue.line;
-    const column = sourceValue.column;
-    if (file === undefined || !Number.isInteger(line) || (line as number) < 1) {
-      throw new Error(`${context}.source requires a file and positive line`);
-    }
-    if (column !== undefined && (!Number.isInteger(column) || (column as number) < 1)) {
-      throw new Error(`${context}.source.column must be a positive integer`);
-    }
-    return {
-      file,
-      line: line as number,
-      ...(column === undefined ? {} : { column: column as number }),
-    };
-  }
-
-  const file = stringValue(firstDefined(record, ['file', 'sourceFile']));
-  const line = firstDefined(record, ['line', 'sourceLine']);
-  const column = firstDefined(record, ['column', 'sourceColumn']);
-  if (file === undefined && line === undefined && column === undefined) return undefined;
-  if (file === undefined || !Number.isInteger(line) || (line as number) < 1) {
-    throw new Error(`${context} requires a file and positive line`);
-  }
-  if (column !== undefined && (!Number.isInteger(column) || (column as number) < 1)) {
-    throw new Error(`${context}.column must be a positive integer`);
-  }
-  return {
-    file,
-    line: line as number,
-    ...(column === undefined ? {} : { column: column as number }),
-  };
-}
-
-function numberValue(value: unknown, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback;
-}
-
-function eventTimestamp(record: JsonRecord, index: number): number {
-  return numberValue(
-    firstDefined(record, ['observedAt', 'timestamp', 'time', 'logicalTimestamp', 'logicalTime']),
-    index,
-  );
-}
-
-function eventIdentifier(record: JsonRecord, index: number): string {
-  return identifierValue(firstDefined(record, ['id', 'eventId', 'name'])) ?? String(index);
-}
-
-function operationForRecord(record: JsonRecord): TraceOperation {
-  const mode = normalizeToken(
-    firstDefined(record, ['mode', 'access', 'accessType', 'operation', 'op', 'kind', 'type']),
-  );
-  if (mode === 'read' || mode === 'write' || mode === 'load' || mode === 'store') return 'access';
-
-  const candidates = [
-    firstDefined(record, ['event', 'eventType', 'kind', 'type', 'action', 'operation', 'op']),
-  ];
-  for (const candidate of candidates) {
-    const token = normalizeToken(candidate);
-    if (
-      [
-        'acquire',
-        'lockacquire',
-        'acquired',
-        'lockacquired',
-        'acquiredlock',
-        'lockacquisition',
-        'hold',
-        'lockhold',
-        'lockheld',
-      ].includes(token)
-    ) {
-      return 'acquire';
-    }
-    if (['release', 'lockrelease', 'released', 'lockreleased', 'unlock', 'unlocked'].includes(token)) {
-      return 'release';
-    }
-    if (
-      [
-        'wait',
-        'waitfor',
-        'lockwait',
-        'waiting',
-        'waitingfor',
-        'blocked',
-        'lockblocked',
-        'lockrequest',
-        'request',
-        'contended',
-      ].includes(token)
-    ) {
-      return 'wait';
-    }
-    if (['fork', 'spawn'].includes(token)) return 'fork';
-    if (token === 'join') return 'join';
-    if (['sync', 'synchronize', 'happensbefore', 'hb', 'barrier'].includes(token)) return 'sync';
-    if (['pool', 'poolsample', 'connectionpool', 'connectionpoolsample'].includes(token)) return 'pool';
-  }
-
-  if (
-    firstDefined(record, ['location', 'address', 'resourceKey', 'memoryAddress']) !== undefined &&
-    firstDefined(record, ['mode', 'access', 'accessType', 'operation', 'op', 'kind', 'type']) !== undefined
+class HttpValidationError extends Error {
+  public constructor(
+    public readonly statusCode: number,
+    message: string,
+    public readonly code: string,
+    public readonly details: readonly ValidationIssue[],
   ) {
-    return 'access';
-  }
-  if (
-    firstDefined(record, ['capacity']) !== undefined &&
-    firstDefined(record, ['inUse', 'used', 'active']) !== undefined
-  ) {
-    return 'pool';
-  }
-  return undefined;
-}
-
-function parseLogLine(line: string, index: number): JsonRecord | undefined {
-  const trimmed = line.trim();
-  if (trimmed.length === 0) return undefined;
-  try {
-    const parsed: unknown = JSON.parse(trimmed);
-    return isRecord(parsed) ? parsed : undefined;
-  } catch {
-    // A production log often has one lock event per line rather than JSON.
-  }
-
-  const actionMatch = trimmed.match(/\b(acquire|acquired|release|released|unlock|wait|waiting|blocked|request|contended)\b/i);
-  if (!actionMatch) return undefined;
-  const action = actionMatch[1].toLowerCase();
-  const threadMatch = trimmed.match(/\b(?:thread|worker|execution|tid)\s*[=:]\s*([\w.:-]+)/i);
-  const resourceMatch = trimmed.match(/\b(?:lock|mutex|resource|key)\s*[=:]\s*([\w.:-]+)/i);
-  const holderMatch = trimmed.match(/\b(?:holder|owner|heldby|held-by|by)\s*[=:]\s*([\w.:-]+)/i);
-  const timestampMatch = trimmed.match(/^\[?(\d+(?:\.\d+)?)\]?/);
-  const sourceMatch = trimmed.match(/([\w./\\-]+\.(?:ts|tsx|js|jsx|java|go|py)):(\d+)/i);
-  const event: JsonRecord = {
-    id: `log-${index}`,
-    kind: action,
-    ...(threadMatch ? { threadId: threadMatch[1] } : {}),
-    ...(resourceMatch ? { lockId: resourceMatch[1] } : {}),
-    ...(holderMatch ? { holderId: holderMatch[1] } : {}),
-    ...(timestampMatch ? { observedAt: Number(timestampMatch[1]) } : {}),
-    ...(sourceMatch
-      ? { source: { file: sourceMatch[1], line: Number(sourceMatch[2]) } }
-      : {}),
-  };
-  return event;
-}
-
-function parseSerializedTrace(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  const trimmed = value.trim();
-  if (trimmed.length === 0) return [];
-  try {
-    return JSON.parse(trimmed) as unknown;
-  } catch {
-    return trimmed
-      .split(/\r?\n/)
-      .map((line, index) => parseLogLine(line, index))
-      .filter((event): event is JsonRecord => event !== undefined);
+    super(message);
+    this.name = 'HttpValidationError';
   }
 }
 
-function arrayValue(record: JsonRecord, names: readonly string[]): readonly unknown[] | undefined {
-  const value = firstDefined(record, names);
-  return Array.isArray(value) ? value : undefined;
-}
-
-function eventListFrom(value: unknown): unknown[] {
-  const parsed = parseSerializedTrace(value);
-  if (Array.isArray(parsed)) return [...parsed];
-  if (!isRecord(parsed)) return [];
-
-  const result: unknown[] = [];
-  const seen = new Set<readonly unknown[]>();
-  const append = (names: readonly string[]): void => {
-    const events = arrayValue(parsed, names);
-    if (events === undefined || seen.has(events)) return;
-    seen.add(events);
-    result.push(...events);
-  };
-  append(['events', 'traceEvents']);
-  append(['lockEvents', 'lockTrace', 'logs']);
-  append(['accesses', 'memoryAccesses']);
-  append(['synchronization', 'synchronizationEvents', 'syncEvents']);
-  append(['poolSamples', 'poolEvents']);
-  if (result.length === 0) result.push(parsed);
-  return result;
-}
-
-function graphCandidateFromBody(body: unknown): unknown | undefined {
-  if (!isRecord(body)) return undefined;
-  const explicit = firstDefined(body, ['graph', 'waitForGraph', 'graphSnapshot']);
-  if (explicit !== undefined) return explicit;
-  if (isGraphSnapshotLike(body)) return body;
-  const trace = firstDefined(body, ['trace', 'logTrace', 'lockEventTrace', 'events', 'lockEvents']);
-  return isGraphSnapshotLike(trace) ? trace : undefined;
-}
-
-function isGraphSnapshotLike(value: unknown): value is JsonRecord {
-  if (!isRecord(value)) return false;
-  return (
-    Array.isArray(value.executionNodes) ||
-    Array.isArray(value.resourceNodes) ||
-    Array.isArray(value.acquisitions) ||
-    Array.isArray(value.waitForEdges) ||
-    (Array.isArray(value.nodes) && Array.isArray(value.edges))
-  );
-}
-
-function normalizeNodeName(record: JsonRecord, id: string): string {
-  return stringValue(firstDefined(record, ['name', 'label', 'title'])) ?? id;
-}
-
-function addExecutionDefinition(
-  definitions: Map<string, ExecutionNode>,
-  raw: unknown,
-  index: number,
-): void {
-  if (!isRecord(raw)) throw new Error(`execution node ${index} must be an object`);
-  const id = requiredIdentifier(raw, ['id', 'threadId', 'executionId', 'serviceId'], `execution node ${index}.id`);
-  const kind = normalizeToken(firstDefined(raw, ['kind', 'type']));
-  const source = sourceFromRecord(raw, `execution node ${index}`);
-  if (kind === 'service') {
-    definitions.set(id, {
-      id,
-      name: normalizeNodeName(raw, id),
-      kind: 'service',
-      ...(source ? { source } : {}),
-    });
-    return;
+export function validateLockEventsPayload(body: unknown): {
+  readonly events: LockEvent[];
+  readonly sourceCode?: string;
+  readonly workers?: number;
+} {
+  if (!isRecord(body)) {
+    throw new HttpValidationError(
+      400,
+      'Request body must be a JSON object containing an "events" array of LockEvent records.',
+      'INVALID_EVENTS_PAYLOAD',
+      [{ field: 'body', message: 'Expected a JSON object with an "events" array.' }],
+    );
   }
-  const serviceId = identifierValue(firstDefined(raw, ['serviceId', 'service']));
-  definitions.set(id, {
-    id,
-    name: normalizeNodeName(raw, id),
-    kind: 'thread',
-    ...(serviceId ? { serviceId } : {}),
-    ...(source ? { source } : {}),
-  });
-}
 
-function addResourceDefinition(
-  definitions: Map<string, ResourceNode>,
-  raw: unknown,
-  index: number,
-): void {
-  if (!isRecord(raw)) throw new Error(`resource node ${index} must be an object`);
-  const id = requiredIdentifier(raw, ['id', 'resourceId', 'lockId', 'name'], `resource node ${index}.id`);
-  const kind = normalizeToken(firstDefined(raw, ['kind', 'type']));
-  const source = sourceFromRecord(raw, `resource node ${index}`);
-  const isLock = kind.includes('lock') || kind.includes('mutex') || kind === 'rwlock';
-  definitions.set(id, {
-    id,
-    name: normalizeNodeName(raw, id),
-    kind: isLock ? 'lock' : 'resource',
-    ...(source ? { source } : {}),
-  });
-}
-
-function snapshotFromGraphCandidate(candidate: unknown): WaitForGraphSnapshot {
-  if (!isRecord(candidate)) throw new Error('graph must be an object');
-
-  const executionDefinitions = new Map<string, ExecutionNode>();
-  const resourceDefinitions = new Map<string, ResourceNode>();
-  const nodeList = arrayValue(candidate, ['nodes']) ?? [];
-  const executionList = arrayValue(candidate, ['executionNodes', 'executions', 'threads', 'services']) ?? [];
-  const resourceList = arrayValue(candidate, ['resourceNodes', 'resources', 'locks']) ?? [];
-
-  for (let index = 0; index < executionList.length; index += 1) {
-    addExecutionDefinition(executionDefinitions, executionList[index], index);
+  const rawEvents = body.events;
+  if (!Array.isArray(rawEvents) || rawEvents.length === 0) {
+    throw new HttpValidationError(
+      400,
+      'Field "events" is required and must be a non-empty array of LockEvent objects.',
+      'INVALID_EVENTS_PAYLOAD',
+      [{ field: 'events', message: 'Must be a non-empty array of LockEvent objects.' }],
+    );
   }
-  for (let index = 0; index < resourceList.length; index += 1) {
-    addResourceDefinition(resourceDefinitions, resourceList[index], index);
-  }
-  for (let index = 0; index < nodeList.length; index += 1) {
-    const node = nodeList[index];
-    if (!isRecord(node)) throw new Error(`graph node ${index} must be an object`);
-    const kind = normalizeToken(firstDefined(node, ['kind', 'type']));
-    if (kind.includes('lock') || kind.includes('mutex') || kind === 'resource' || kind === 'rwlock') {
-      addResourceDefinition(resourceDefinitions, node, index);
-    } else {
-      addExecutionDefinition(executionDefinitions, node, index);
+
+  const issues: ValidationIssue[] = [];
+  const validatedEvents: LockEvent[] = [];
+
+  rawEvents.forEach((item, index) => {
+    if (!isRecord(item)) {
+      issues.push({ index, field: `events[${index}]`, message: 'Event must be a JSON object.' });
+      return;
     }
-  }
 
-  const acquisitions = arrayValue(candidate, ['acquisitions', 'heldResources', 'holds']) ?? [];
-  const edges = arrayValue(candidate, ['waitForEdges', 'waits', 'edges']) ?? [];
+    const workerId = typeof item.workerId === 'string' ? item.workerId.trim() : '';
+    const resourceId = typeof item.resourceId === 'string' ? item.resourceId.trim() : '';
+    const action = typeof item.action === 'string' ? item.action.trim().toUpperCase() : '';
+    const timestamp = typeof item.timestamp === 'number' && Number.isFinite(item.timestamp) ? item.timestamp : index;
+    const file = typeof item.file === 'string' && item.file.trim().length > 0 ? item.file.trim() : 'trace.ts';
+    const line = typeof item.line === 'number' && Number.isInteger(item.line) && item.line >= 1 ? item.line : 1;
+    const codeSnippet =
+      typeof item.codeSnippet === 'string' && item.codeSnippet.trim().length > 0
+        ? item.codeSnippet
+        : `${action} ${resourceId}`;
+    const id = typeof item.id === 'string' && item.id.trim().length > 0 ? item.id.trim() : `evt-${index + 1}`;
 
-  const ensureExecution = (id: string): void => {
-    if (!executionDefinitions.has(id)) {
-      executionDefinitions.set(id, { id, name: id, kind: 'thread' });
+    if (!workerId) {
+      issues.push({ index, field: `events[${index}].workerId`, message: 'workerId must be a non-empty string.' });
     }
-  };
-  const ensureResource = (id: string): void => {
-    if (!resourceDefinitions.has(id)) {
-      resourceDefinitions.set(id, { id, name: id, kind: 'lock' });
+    if (!resourceId) {
+      issues.push({ index, field: `events[${index}].resourceId`, message: 'resourceId must be a non-empty string.' });
     }
-  };
+    if (!VALID_ACTIONS.has(action)) {
+      issues.push({
+        index,
+        field: `events[${index}].action`,
+        message: 'action must be one of ACQUIRE, WAIT, RELEASE, READ, or WRITE.',
+      });
+    }
 
-  const normalizedAcquisitions = acquisitions.map((raw, index) => {
-    if (!isRecord(raw)) throw new Error(`acquisition ${index} must be an object`);
-    const resourceId = requiredIdentifier(raw, ['resourceId', 'lockId', 'resource', 'lock'], `acquisition ${index}.resourceId`);
-    const holderId = requiredIdentifier(raw, ['holderId', 'ownerId', 'threadId', 'executionId', 'holder'], `acquisition ${index}.holderId`);
-    ensureResource(resourceId);
-    ensureExecution(holderId);
-    const source = sourceFromRecord(raw, `acquisition ${index}`);
-    return {
-      resourceId,
-      holderId,
-      acquiredAt: eventTimestamp(raw, index),
-      ...(source ? { source } : {}),
-    };
-  });
+    const vectorClock: Record<string, number> = {};
+    if (item.vectorClock !== undefined) {
+      if (!isRecord(item.vectorClock)) {
+        issues.push({
+          index,
+          field: `events[${index}].vectorClock`,
+          message: 'vectorClock must be an object mapping worker IDs to non-negative integers.',
+        });
+      } else {
+        for (const [k, v] of Object.entries(item.vectorClock)) {
+          if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+            issues.push({
+              index,
+              field: `events[${index}].vectorClock.${k}`,
+              message: 'Clock value must be a non-negative integer.',
+            });
+          } else {
+            vectorClock[k] = v;
+          }
+        }
+      }
+    }
 
-  const normalizedEdges = edges.map((raw, index) => {
-    if (!isRecord(raw)) throw new Error(`wait-for edge ${index} must be an object`);
-    const waiterId = requiredIdentifier(raw, ['waiterId', 'waiter', 'threadId', 'executionId'], `wait-for edge ${index}.waiterId`);
-    const holderId = requiredIdentifier(raw, ['holderId', 'holder', 'ownerId', 'owner'], `wait-for edge ${index}.holderId`);
-    const resourceId = requiredIdentifier(raw, ['resourceId', 'lockId', 'resource', 'lock'], `wait-for edge ${index}.resourceId`);
-    ensureExecution(waiterId);
-    ensureExecution(holderId);
-    ensureResource(resourceId);
-    const source = sourceFromRecord(raw, `wait-for edge ${index}`);
-    const id = identifierValue(raw.id) ?? `${waiterId}->${holderId}:${resourceId}:${index}`;
-    return {
-      id,
-      waiterId,
-      holderId,
-      resourceId,
-      observedAt: eventTimestamp(raw, index),
-      ...(source ? { source } : {}),
-    };
-  });
-
-  const graph = new WaitForGraph();
-  for (const node of executionDefinitions.values()) graph.addExecutionNode(node);
-  for (const node of resourceDefinitions.values()) {
-    if (node.kind === 'lock') graph.addLock(node);
-    else graph.addResource(node);
-  }
-  for (const acquisition of normalizedAcquisitions) graph.recordAcquisition(acquisition);
-  for (const edge of normalizedEdges) graph.addWaitFor(edge);
-  return graph.toJSON();
-}
-
-function recordIdentifier(record: JsonRecord, names: readonly string[]): string | undefined {
-  return identifierValue(firstDefined(record, names));
-}
-
-function parseTraceEvents(value: unknown): ParsedTraceEvent[] {
-  return eventListFrom(value).flatMap((raw, index): ParsedTraceEvent[] => {
-    if (!isRecord(raw)) return [];
-    const operation = operationForRecord(raw);
-    if (operation === undefined) return [];
-    const source = sourceFromRecord(raw, `event ${index}`);
-    const threadId = recordIdentifier(raw, ['threadId', 'executionId', 'thread', 'worker', 'waiterId', 'waiter']);
-    const holderId = recordIdentifier(raw, ['holderId', 'ownerId', 'holder', 'owner', 'heldBy', 'otherThreadId']);
-    const resourceId = recordIdentifier(raw, [
-      'lockId',
-      'lock',
-      'resourceId',
-      'resource',
-      'resourceKey',
-      'mutex',
-      'address',
-    ]);
-    return [
-      {
-        operation,
-        threadId,
-        holderId,
-        resourceId,
-        eventId: eventIdentifier(raw, index),
-        observedAt: eventTimestamp(raw, index),
-        source,
-        raw,
-      },
-    ];
-  });
-}
-
-function snapshotFromTraceEvents(events: readonly ParsedTraceEvent[]): WaitForGraphSnapshot {
-  const executionDefinitions = new Map<string, ExecutionNode>();
-  const resourceDefinitions = new Map<string, ResourceNode>();
-  const currentHolders = new Map<string, string>();
-  const acquisitions = new Map<string, {
-    readonly resourceId: string;
-    readonly holderId: string;
-    readonly acquiredAt: number;
-    readonly source?: SourceCodeReference;
-  }>();
-  const edges: Array<{
-    readonly id: string;
-    readonly waiterId: string;
-    readonly holderId: string;
-    readonly resourceId: string;
-    readonly observedAt: number;
-    readonly source?: SourceCodeReference;
-  }> = [];
-
-  const addExecution = (id: string, source?: SourceCodeReference): void => {
-    if (!executionDefinitions.has(id)) {
-      executionDefinitions.set(id, {
+    if (issues.length === 0) {
+      validatedEvents.push({
         id,
-        name: id,
-        kind: 'thread',
-        ...(source ? { source } : {}),
-      });
-    }
-  };
-  const addResource = (id: string, source?: SourceCodeReference): void => {
-    if (!resourceDefinitions.has(id)) {
-      resourceDefinitions.set(id, {
-        id,
-        name: id,
-        kind: 'lock',
-        ...(source ? { source } : {}),
-      });
-    }
-  };
-
-  for (const event of events) {
-    const { operation, threadId, holderId, resourceId, source } = event;
-    if (threadId !== undefined) addExecution(threadId, source);
-    if (holderId !== undefined && ['wait', 'acquire'].includes(operation)) addExecution(holderId, source);
-    if (resourceId !== undefined && ['wait', 'acquire', 'release'].includes(operation)) addResource(resourceId, source);
-
-    if (operation === 'acquire') {
-      if (threadId === undefined || resourceId === undefined) {
-        throw new Error(`event ${event.eventId} acquire requires threadId and lockId`);
-      }
-      currentHolders.set(resourceId, threadId);
-      acquisitions.set(resourceId, {
+        workerId,
         resourceId,
-        holderId: threadId,
-        acquiredAt: event.observedAt,
-        ...(source ? { source } : {}),
-      });
-      continue;
-    }
-
-    if (operation === 'release') {
-      if (resourceId === undefined) throw new Error(`event ${event.eventId} release requires lockId`);
-      if (threadId === undefined || currentHolders.get(resourceId) === threadId) {
-        currentHolders.delete(resourceId);
-        acquisitions.delete(resourceId);
-      }
-      continue;
-    }
-
-    if (operation === 'wait') {
-      if (threadId === undefined || resourceId === undefined) {
-        throw new Error(`event ${event.eventId} wait requires threadId and lockId`);
-      }
-      const effectiveHolder = holderId ?? currentHolders.get(resourceId);
-      if (effectiveHolder === undefined) continue;
-      addExecution(effectiveHolder, source);
-      addResource(resourceId, source);
-      edges.push({
-        id: `${event.eventId}:${threadId}->${effectiveHolder}:${resourceId}`,
-        waiterId: threadId,
-        holderId: effectiveHolder,
-        resourceId,
-        observedAt: event.observedAt,
-        ...(source ? { source } : {}),
+        action: action as LockEvent['action'],
+        timestamp,
+        vectorClock,
+        file,
+        line,
+        codeSnippet,
       });
     }
-  }
-
-  const graph = new WaitForGraph();
-  for (const node of executionDefinitions.values()) graph.addExecutionNode(node);
-  for (const node of resourceDefinitions.values()) graph.addLock(node);
-  for (const acquisition of acquisitions.values()) graph.recordAcquisition(acquisition);
-  const edgeIds = new Set<string>();
-  for (const edge of edges) {
-    let id = edge.id;
-    let suffix = 1;
-    while (edgeIds.has(id)) id = `${edge.id}:${suffix++}`;
-    edgeIds.add(id);
-    graph.addWaitFor({ ...edge, id });
-  }
-  return graph.toJSON();
-}
-
-function raceInputFromEvents(events: readonly ParsedTraceEvent[]): RaceAnalysisInput {
-  const raceEvents = events.flatMap((event): JsonRecord[] => {
-    if (event.operation === 'access') return [event.raw];
-    if (event.operation === 'pool') return [event.raw];
-    if (event.operation === 'acquire' || event.operation === 'release') {
-      if (event.threadId === undefined || event.resourceId === undefined) return [];
-      return [
-        {
-          ...event.raw,
-          kind: event.operation,
-          threadId: event.threadId,
-          lockId: event.resourceId,
-          ...(event.source ? { source: event.source } : {}),
-        },
-      ];
-    }
-    if (event.operation === 'fork' || event.operation === 'join' || event.operation === 'sync') {
-      return [{ ...event.raw, kind: event.operation, ...(event.source ? { source: event.source } : {}) }];
-    }
-    return [];
   });
-  return raceEvents as RaceAnalysisInput;
-}
 
-function sourceFromScenarioId(scenarioId: string, line: number): SourceCodeReference {
-  return { file: `src/scenarios/${scenarioId}.ts`, line };
-}
-
-function snapshotForPreset(scenario: IncidentScenario): WaitForGraphSnapshot {
-  const resourceIds = scenario.contention.resourceOrder.length > 0
-    ? scenario.contention.resourceOrder
-    : scenario.contention.resources.map((resource) => resource.id);
-  const isLockCycle =
-    scenario.category === 'deadlock' ||
-    scenario.category === 'distributed-deadlock' ||
-    scenario.contention.mode === 'ordered-locks' ||
-    scenario.contention.mode === 'circular-rpc';
-  const graph = new WaitForGraph();
-  for (const [index, resourceId] of resourceIds.entries()) {
-    const resource = scenario.contention.resources.find((candidate) => candidate.id === resourceId);
-    const source = sourceFromScenarioId(scenario.id, 20 + index);
-    const node: ResourceNode = {
-      id: resourceId,
-      name: resource?.description ?? resourceId,
-      kind: isLockCycle ? 'lock' : 'resource',
-      source,
-    };
-    if (node.kind === 'lock') graph.addLock(node);
-    else graph.addResource(node);
+  if (issues.length > 0) {
+    throw new HttpValidationError(
+      400,
+      `Invalid LockEvent payload: ${issues[0].field} — ${issues[0].message}`,
+      'INVALID_EVENTS_PAYLOAD',
+      issues,
+    );
   }
 
-  if (isLockCycle && resourceIds.length >= 2) {
-    for (let index = 0; index < resourceIds.length; index += 1) {
-      const workerId = `${scenario.id}:worker-${index + 1}`;
-      graph.addThread({
-        id: workerId,
-        name: `preset worker ${index + 1}`,
-        source: sourceFromScenarioId(scenario.id, 40 + index),
-      });
+  let workers: number | undefined;
+  if (body.workers !== undefined) {
+    if (typeof body.workers !== 'number' || !Number.isInteger(body.workers) || body.workers < 1) {
+      throw new HttpValidationError(
+        400,
+        'Field "workers" must be a positive integer.',
+        'INVALID_EVENTS_PAYLOAD',
+        [{ field: 'workers', message: 'Must be a positive integer.' }],
+      );
     }
-    for (let index = 0; index < resourceIds.length; index += 1) {
-      const workerId = `${scenario.id}:worker-${index + 1}`;
-      const nextWorkerId = `${scenario.id}:worker-${(index + 1) % resourceIds.length + 1}`;
-      const heldResourceId = resourceIds[index];
-      const waitedResourceId = resourceIds[(index + 1) % resourceIds.length];
-      graph.recordAcquisition({
-        resourceId: heldResourceId,
-        holderId: workerId,
-        acquiredAt: 50 + index,
-        source: sourceFromScenarioId(scenario.id, 50 + index),
-      });
-      graph.addWaitFor({
-        id: `${scenario.id}:wait-${index + 1}`,
-        waiterId: workerId,
-        holderId: nextWorkerId,
-        resourceId: waitedResourceId,
-        observedAt: 60 + index,
-        source: sourceFromScenarioId(scenario.id, 60 + index),
-      });
-    }
-  } else if (resourceIds.length > 0) {
-    graph.addThread({
-      id: `${scenario.id}:worker-1`,
-      name: 'preset worker',
-      source: sourceFromScenarioId(scenario.id, 40),
-    });
+    workers = body.workers;
   }
-  return graph.toJSON();
-}
 
-function raceInputForPreset(scenario: IncidentScenario): RaceAnalysisInput {
-  if (scenario.category === 'data-race') {
-    return [
-      {
-        id: `${scenario.id}:reservation-write`,
-        threadId: `${scenario.id}:reservation-worker`,
-        location: 'inventory.available',
-        mode: 'write',
-        clock: { [`${scenario.id}:reservation-worker`]: 1 },
-        source: sourceFromScenarioId(scenario.id, 88),
-      },
-      {
-        id: `${scenario.id}:cancellation-write`,
-        threadId: `${scenario.id}:cancellation-worker`,
-        location: 'inventory.available',
-        mode: 'write',
-        clock: { [`${scenario.id}:cancellation-worker`]: 1 },
-        source: sourceFromScenarioId(scenario.id, 104),
-      },
-    ];
-  }
-  if (scenario.category === 'resource-starvation') {
-    const pool = scenario.contention.resources.find((resource) => resource.kind === 'connection-pool');
-    if (pool !== undefined) {
-      return [
-        {
-          type: 'pool',
-          id: `${scenario.id}:pool-1`,
-          poolId: pool.id,
-          capacity: pool.capacity,
-          inUse: pool.capacity,
-          queued: 12,
-          observedAt: 1_000,
-          source: sourceFromScenarioId(scenario.id, 72),
-        },
-        {
-          type: 'pool',
-          id: `${scenario.id}:pool-2`,
-          poolId: pool.id,
-          capacity: pool.capacity,
-          inUse: pool.capacity,
-          queued: 28,
-          observedAt: 2_000,
-          source: sourceFromScenarioId(scenario.id, 80),
-        },
-      ];
-    }
-  }
-  return [];
-}
+  const sourceCode = typeof body.sourceCode === 'string' && body.sourceCode.trim().length > 0
+    ? body.sourceCode
+    : undefined;
 
-function customScenario(
-  body: unknown,
-  graph: WaitForGraphSnapshot,
-  sourceEvents: readonly ParsedTraceEvent[],
-  raceAnalysis: RaceAnalysis,
-): JsonRecord {
-  const record = isRecord(body) ? body : {};
-  const graphResources = graph.resourceNodes.map((resource) => resource.id);
-  const sourceFile = sourceEvents.find((event) => event.source !== undefined)?.source?.file;
-  const name = stringValue(firstDefined(record, ['name', 'title', 'label'])) ?? 'Custom lock-event trace';
-  const id = stringValue(firstDefined(record, ['id', 'traceId', 'scenarioId'])) ?? 'custom-lock-event-trace';
-  const category = graphResources.length > 0 || graph.waitForEdges.length > 0
-    ? 'deadlock'
-    : raceAnalysis.races.length > 0
-      ? 'data-race'
-      : 'contention';
-  return {
-    id,
-    title: name,
-    category,
-    sourceFile: sourceFile ?? 'src/concurrency/locks.ts',
-    locks: graphResources,
-    resourceOrder: graphResources,
-    contention: {
-      mode: category === 'deadlock' ? 'ordered-locks' : 'optimistic-race',
-      resourceOrder: graphResources,
-      observedOrderings: graphResources.length > 0 ? [graphResources] : [],
-      resources: graph.resourceNodes.map((resource) => ({
-        id: resource.id,
-        kind: resource.kind === 'lock' ? 'mutex' : 'worker-slot',
-        capacity: 1,
-        pressure: 'high',
-        description: resource.name,
-      })),
-    },
-  };
-}
-
-function graphWithAliases(snapshot: WaitForGraphSnapshot): AnalysisResponse['graph'] {
-  const nodes = [...snapshot.executionNodes, ...snapshot.resourceNodes];
-  return {
-    ...snapshot,
-    nodes,
-    edges: snapshot.waitForEdges,
-  };
-}
-
-function sourceKey(source: SourceCodeReference): string {
-  return `${source.file}:${source.line}:${source.column ?? ''}`;
+  return { events: validatedEvents, sourceCode, workers };
 }
 
 function collectOffendingCodeLines(
   deadlocks: readonly DeadlockFinding[],
   raceAnalysis: RaceAnalysis,
+  events: readonly LockEvent[],
 ): SourceCodeReference[] {
   const sources: SourceCodeReference[] = [];
   for (const finding of deadlocks) {
-    sources.push(...finding.waitSources.filter((source): source is SourceCodeReference => source !== undefined));
-    sources.push(...finding.acquisitionSources.filter((source): source is SourceCodeReference => source !== undefined));
+    sources.push(...finding.waitSources.filter((s): s is SourceCodeReference => s !== undefined));
+    sources.push(...finding.acquisitionSources.filter((s): s is SourceCodeReference => s !== undefined));
   }
   for (const finding of raceAnalysis.races) {
-    sources.push(...finding.sourceLocations.filter((source): source is SourceCodeReference => source !== undefined));
+    sources.push(...finding.sourceLocations.filter((s): s is SourceCodeReference => s !== undefined));
   }
   for (const finding of raceAnalysis.poolStarvation) {
-    sources.push(...finding.sourceLocations.filter((source): source is SourceCodeReference => source !== undefined));
+    sources.push(...finding.sourceLocations.filter((s): s is SourceCodeReference => s !== undefined));
+  }
+  for (const ev of events) {
+    if (ev.file && Number.isInteger(ev.line) && ev.line >= 1) {
+      sources.push({ file: ev.file, line: ev.line });
+    }
   }
   const unique = new Map<string, SourceCodeReference>();
-  for (const source of sources) unique.set(sourceKey(source), { ...source });
+  for (const source of sources) {
+    unique.set(`${source.file}:${source.line}:${source.column ?? ''}`, { ...source });
+  }
   return [...unique.values()].sort(
-    (left, right) => left.file.localeCompare(right.file) || left.line - right.line || (left.column ?? 0) - (right.column ?? 0),
+    (left, right) => left.file.localeCompare(right.file) || left.line - right.line,
   );
 }
 
-function presetIdFromRequest(body: unknown, request: Request): string | undefined {
-  const queryValue = stringValue(request.query.presetId) ?? stringValue(request.query.scenarioId);
-  if (queryValue !== undefined) return queryValue;
-  if (typeof body === 'string' && getScenarioPreset(body) !== undefined) return body;
-  if (!isRecord(body)) return undefined;
-  const explicit = stringValue(firstDefined(body, ['presetId', 'scenarioId', 'preset']));
-  if (explicit !== undefined) return explicit;
-  const shorthand = stringValue(body.id);
-  return shorthand !== undefined && getScenarioPreset(shorthand) !== undefined ? shorthand : undefined;
-}
-
-function racePayloadFromBody(body: unknown): unknown {
-  if (!isRecord(body)) return body;
-  return firstDefined(body, ['raceTrace', 'raceEvents', 'vectorClockTrace']) ?? body;
-}
-
-function tracePayloadFromBody(body: unknown): unknown {
-  if (!isRecord(body)) return body;
-  return firstDefined(body, ['trace', 'logTrace', 'lockEventTrace', 'events', 'lockEvents']) ?? body;
-}
-
-function isLockEventLike(item: unknown): item is LockEvent {
-  if (!isRecord(item)) return false;
-  return (
-    typeof item.workerId === 'string' &&
-    typeof item.resourceId === 'string' &&
-    typeof item.action === 'string'
-  );
-}
-
-function extractCustomLockEvents(body: unknown): LockEvent[] | undefined {
-  if (Array.isArray(body) && body.length > 0 && body.every(isLockEventLike)) {
-    return body;
-  }
-  if (!isRecord(body)) return undefined;
-  const candidate = firstDefined(body, ['customEvents', 'events', 'trace']);
-  if (Array.isArray(candidate) && candidate.length > 0 && candidate.every(isLockEventLike)) {
-    return candidate as LockEvent[];
-  }
-  return undefined;
-}
-
-function analyzeBody(body: unknown, request: Request): AnalysisResponse {
-  const presetId = presetIdFromRequest(body, request);
-  const customLockEvents = extractCustomLockEvents(body);
-
-  if (presetId !== undefined || customLockEvents !== undefined) {
-    let preset: IncidentScenario | undefined;
-    if (presetId !== undefined) {
-      preset = getScenarioPreset(presetId);
-      if (preset === undefined) {
-        throw new HttpError(404, `Unknown scenario preset "${presetId}"`, 'SCENARIO_NOT_FOUND');
-      }
-    }
-    const events: LockEvent[] = customLockEvents ?? (preset ? preset.events : []);
-    const wfg = buildWaitForGraph(events);
-    const deadlocks = detectDeadlocks(wfg);
-    const races = detectRaces(events);
-    const poolStarvation = preset && preset.category === 'resource-starvation' && detectStarvation(events).length === 0
-      ? analyzeRaceTrace(raceInputForPreset(preset)).poolStarvation
-      : detectStarvation(events);
-    const raceAnalysis: RaceAnalysis = {
-      races,
-      dataRaces: races,
-      poolStarvation,
-      poolStarvationFindings: poolStarvation,
-    };
-    const remediation = preset
-      ? remediateScenario(preset)
-      : generateRemediationPlan(events, deadlocks, races);
-    const offendingCodeLines = collectOffendingCodeLines(deadlocks, raceAnalysis);
-    for (const ev of events) {
-      if (ev.file && Number.isInteger(ev.line) && ev.line >= 1) {
-        const ref: SourceCodeReference = { file: ev.file, line: ev.line };
-        if (!offendingCodeLines.some((item) => item.file === ref.file && item.line === ref.line)) {
-          offendingCodeLines.push(ref);
-        }
-      }
-    }
-    const source: AnalysisSource = preset
-      ? { kind: 'preset', scenarioId: preset.id, scenarioName: preset.title }
-      : { kind: 'custom', scenarioId: 'custom-trace', scenarioName: 'Custom Lock Trace' };
-
-    return {
-      source,
-      scenario: preset ?? { id: 'custom-trace', title: 'Custom Lock Trace', events },
-      events,
-      graph: {
-        executionNodes: wfg.executionNodes,
-        resourceNodes: wfg.resourceNodes,
-        acquisitions: wfg.acquisitions,
-        waitForEdges: wfg.waitForEdges,
-        nodes: wfg.nodes,
-        edges: wfg.edges,
-      },
-      nodes: wfg.nodes,
-      edges: wfg.edges,
-      deadlocks,
-      detectedCycles: deadlocks.map((d) => [...d.cycle]),
-      cycles: deadlocks,
-      raceAnalysis,
-      races,
-      dataRaces: races,
-      poolStarvation,
-      starvation: poolStarvation,
-      offendingCodeLines,
-      offendingLines: offendingCodeLines,
-      patch: remediation.unifiedDiff,
-      patchDiff: remediation.unifiedDiff,
-      diff: remediation.unifiedDiff,
-      unifiedDiff: remediation.unifiedDiff,
-      remediation,
-      remediationPlan: remediation,
-      incidentChecklist: remediation.runbookMarkdown,
-      checklist: remediation.runbookMarkdown,
-      runbook: remediation.runbookMarkdown,
-      runbookMarkdown: remediation.runbookMarkdown,
-    };
-  }
-
-  let scenario: IncidentScenario | JsonRecord;
-  let graphSnapshot: WaitForGraphSnapshot;
-  let parsedEvents: ParsedTraceEvent[] = [];
-  let source: AnalysisSource;
-  let raceInput: RaceAnalysisInput;
-
-  const graphCandidate = graphCandidateFromBody(body);
-  if (graphCandidate !== undefined) {
-    graphSnapshot = snapshotFromGraphCandidate(graphCandidate);
-    parsedEvents = parseTraceEvents(racePayloadFromBody(body));
-  } else {
-    parsedEvents = parseTraceEvents(tracePayloadFromBody(body));
-    if (parsedEvents.length === 0) throw new HttpError(400, 'Request must contain a preset ID, graph, or lock-event trace', 'INVALID_ANALYZE_REQUEST');
-    graphSnapshot = snapshotFromTraceEvents(parsedEvents);
-  }
-  raceInput = parsedEvents.length > 0
-    ? raceInputFromEvents(parsedEvents)
-    : raceInputFromEvents(parseTraceEvents(racePayloadFromBody(body)));
-  const preliminaryRaceAnalysis = analyzeRaceTrace(raceInput);
-  scenario = customScenario(body, graphSnapshot, parsedEvents, preliminaryRaceAnalysis);
-  source = {
-    kind: 'custom',
-    scenarioId: String(scenario.id),
-    scenarioName: String(scenario.title),
+function analyzeEvents(body: unknown): AnalysisResponse {
+  const { events, sourceCode } = validateLockEventsPayload(body);
+  const wfg = buildWaitForGraph(events);
+  const deadlocks = detectDeadlocks(wfg);
+  const races = detectRaces(events);
+  const poolStarvation = detectStarvation(events);
+  const raceAnalysis: RaceAnalysis = {
+    races,
+    dataRaces: races,
+    poolStarvation,
+    poolStarvationFindings: poolStarvation,
   };
 
-  const deadlocks = detectDeadlocks(graphSnapshot);
-  const raceAnalysis = analyzeRaceTrace(raceInput);
-  const remediation = remediateScenario(scenario);
-  const offendingCodeLines = collectOffendingCodeLines(deadlocks, raceAnalysis);
-  const graph = graphWithAliases(graphSnapshot);
-  const detectedCycles = deadlocks.map((finding) => [...finding.cycle]);
+  const remediation = sourceCode
+    ? generateRemediationPlan(
+        {
+          id: 'trace-analysis',
+          title: 'Lock Trace Forensics',
+          sourceFile: events[0]?.file ?? 'src/concurrency/locks.ts',
+          locks: wfg.resourceNodes.map((r) => r.id),
+          brokenCode: sourceCode,
+        },
+        deadlocks,
+        races,
+      )
+    : generateRemediationPlan(events, deadlocks, races);
+
+  const offendingCodeLines = collectOffendingCodeLines(deadlocks, raceAnalysis, events);
 
   return {
-    source,
-    scenario,
-    events: [],
-    graph,
-    nodes: graph.nodes,
-    edges: graph.edges,
+    events,
+    ...(sourceCode ? { sourceCode } : {}),
+    graph: {
+      executionNodes: wfg.executionNodes,
+      resourceNodes: wfg.resourceNodes,
+      acquisitions: wfg.acquisitions,
+      waitForEdges: wfg.waitForEdges,
+      nodes: wfg.nodes,
+      edges: wfg.edges,
+    },
+    nodes: wfg.nodes,
+    edges: wfg.edges,
     deadlocks,
-    detectedCycles,
+    detectedCycles: deadlocks.map((d) => [...d.cycle]),
     cycles: deadlocks,
     raceAnalysis,
-    races: raceAnalysis.races,
-    dataRaces: raceAnalysis.dataRaces,
-    poolStarvation: raceAnalysis.poolStarvation,
-    starvation: raceAnalysis.poolStarvation,
+    races,
+    dataRaces: races,
+    poolStarvation,
+    starvation: poolStarvation,
     offendingCodeLines,
     offendingLines: offendingCodeLines,
-    patch: remediation.patchText,
-    patchDiff: remediation.diffText,
-    diff: remediation.diffText,
+    patch: remediation.unifiedDiff,
+    patchDiff: remediation.unifiedDiff,
+    diff: remediation.unifiedDiff,
     unifiedDiff: remediation.unifiedDiff,
     remediation,
     remediationPlan: remediation,
-    incidentChecklist: remediation.runbook,
-    checklist: remediation.checklist,
-    runbook: remediation.runbook,
+    incidentChecklist: remediation.runbookMarkdown,
+    checklist: remediation.runbookMarkdown,
+    runbook: remediation.runbookMarkdown,
     runbookMarkdown: remediation.runbookMarkdown,
   };
 }
 
-function metricComparison(before: number, after: number): MetricComparison {
+function benchmarkEvents(body: unknown): {
+  readonly workers: number;
+  readonly workerCount: number;
+  readonly before: SimulationMetrics;
+  readonly after: SimulationMetrics;
+  readonly improvementFactor: number;
+} {
+  const { events, workers } = validateLockEventsPayload(body);
+  const effectiveWorkers = workers ?? configuredWorkerCount();
+  const chaos = runChaosBenchmark(events, effectiveWorkers);
   return {
-    before,
-    after,
-    delta: after - before,
-    improvementFactor: before === 0 ? null : after / before,
+    workers: effectiveWorkers,
+    workerCount: effectiveWorkers,
+    before: chaos.before,
+    after: chaos.after,
+    improvementFactor: chaos.improvementFactor,
   };
 }
 
 function configuredWorkerCount(): number {
   const parsed = Number.parseInt(process.env.SIMULATION_WORKERS ?? String(DEFAULT_WORKER_COUNT), 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WORKER_COUNT;
-}
-
-function benchmarkScenario(scenario: IncidentScenario, customWorkers?: number): BenchmarkComparison {
-  const workerCount = customWorkers ?? configuredWorkerCount();
-  const options = { workerCount } as const;
-  const simBefore = simulateScenario(scenario, { ...options, patched: false });
-  const simAfter = simulateScenario(scenario, { ...options, patched: true });
-  const chaos = runChaosBenchmark(scenario, workerCount);
-  const before = {
-    ...simBefore,
-    ...chaos.before,
-  };
-  const after = {
-    ...simAfter,
-    ...chaos.after,
-  };
-  const comparison = {
-    throughputRps: metricComparison(before.throughputRps, after.throughputRps),
-    latencyMs: {
-      p50: metricComparison(before.p50LatencyMs, after.p50LatencyMs),
-      p95: metricComparison(before.p95LatencyMs, after.p95LatencyMs),
-      p99: metricComparison(before.p99LatencyMs, after.p99LatencyMs),
-    },
-    deadlocks: metricComparison(before.deadlockCount, after.deadlockCount),
-    droppedRequests: metricComparison(before.droppedRequests, after.droppedRequests),
-  };
-  return {
-    scenarioId: scenario.id,
-    scenarioName: scenario.title,
-    workerCount,
-    workers: workerCount,
-    before,
-    after,
-    improvementFactor: chaos.improvementFactor,
-    comparison,
-    metrics: comparison,
-  };
-}
-
-function benchmarkBody(body: unknown, request: Request): {
-  readonly benchmarks: readonly BenchmarkComparison[];
-  readonly selected?: BenchmarkComparison;
-} {
-  const requestedWorkers = isRecord(body) && typeof body.workers === 'number' && body.workers > 0
-    ? Math.round(body.workers)
-    : undefined;
-  const customEvents = extractCustomLockEvents(body);
-  if (customEvents !== undefined) {
-    const fallbackPreset = INCIDENT_PRESETS[0];
-    const baseComparison = benchmarkScenario(fallbackPreset, requestedWorkers);
-    const chaos = runChaosBenchmark(customEvents, requestedWorkers ?? configuredWorkerCount());
-    const selected: BenchmarkComparison = {
-      ...baseComparison,
-      scenarioId: 'custom-trace',
-      scenarioName: 'Custom Lock Trace',
-      before: { ...baseComparison.before, ...chaos.before },
-      after: { ...baseComparison.after, ...chaos.after },
-      improvementFactor: chaos.improvementFactor,
-    };
-    return { benchmarks: [selected], selected };
-  }
-
-  const id = presetIdFromRequest(body, request);
-  if (id !== undefined) {
-    const scenario = getScenarioPreset(id);
-    if (scenario === undefined) throw new HttpError(404, `Unknown scenario preset "${id}"`, 'SCENARIO_NOT_FOUND');
-    const selected = benchmarkScenario(scenario, requestedWorkers);
-    return { benchmarks: [selected], selected };
-  }
-  const all = INCIDENT_PRESETS.map((preset) => benchmarkScenario(preset, requestedWorkers));
-  return { benchmarks: all, selected: all[0] };
 }
 
 function configuredPort(): number {
@@ -1171,20 +369,13 @@ function fallbackIndexHtmlPath(): string {
   return resolve(currentDirectory, '../../index.html');
 }
 
-class HttpError extends Error {
-  public constructor(
-    public readonly statusCode: number,
-    message: string,
-    public readonly code: string,
-  ) {
-    super(message);
-    this.name = 'HttpError';
-  }
-}
-
 function sendError(response: Response, error: unknown): void {
-  if (error instanceof HttpError) {
-    response.status(error.statusCode).json({ error: error.message, code: error.code });
+  if (error instanceof HttpValidationError) {
+    response.status(error.statusCode).json({
+      error: error.message,
+      code: error.code,
+      details: error.details,
+    });
     return;
   }
   const message = error instanceof Error ? error.message : 'Unexpected server error';
@@ -1194,8 +385,6 @@ function sendError(response: Response, error: unknown): void {
 function healthPayload(staticDir: string): JsonRecord {
   const workerCount = configuredWorkerCount();
   const metrics = {
-    presetScenarios: INCIDENT_PRESETS.length,
-    scenarioCount: INCIDENT_PRESETS.length,
     defaultWorkerCount: workerCount,
     detectorCount: 2,
     detectors: ['deadlock-cycles', 'vector-clock-races'],
@@ -1220,24 +409,14 @@ export function createApp(options: ServerOptions = {}): Express {
   app.disable('x-powered-by');
   app.use(cors());
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
-  app.use(express.text({ type: ['text/plain', 'text/*'], limit: JSON_BODY_LIMIT }));
 
   app.get('/api/health', (_request, response) => {
     response.status(200).json(healthPayload(staticDir));
   });
 
-  app.get('/api/scenarios', (_request, response) => {
-    response.status(200).json({
-      scenarios: INCIDENT_PRESETS,
-      presets: INCIDENT_PRESETS,
-      length: INCIDENT_PRESETS.length,
-      count: INCIDENT_PRESETS.length,
-    });
-  });
-
   app.post('/api/analyze', (request, response) => {
     try {
-      response.status(200).json(analyzeBody(request.body, request));
+      response.status(200).json(analyzeEvents(request.body));
     } catch (error) {
       sendError(response, error);
     }
@@ -1245,18 +424,7 @@ export function createApp(options: ServerOptions = {}): Express {
 
   app.post('/api/benchmark', (request, response) => {
     try {
-      const result = benchmarkBody(request.body, request);
-      const selected = result.selected ?? result.benchmarks[0];
-      const workerCount = configuredWorkerCount();
-      response.status(200).json({
-        ...selected,
-        benchmark: selected,
-        benchmarks: result.benchmarks,
-        comparisons: result.benchmarks,
-        count: result.benchmarks.length,
-        workerCount: selected?.workerCount ?? workerCount,
-        workers: selected?.workers ?? workerCount,
-      });
+      response.status(200).json(benchmarkEvents(request.body));
     } catch (error) {
       sendError(response, error);
     }

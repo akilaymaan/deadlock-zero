@@ -25,8 +25,8 @@ function collectRepoFiles(dir: string): string[] {
   return files;
 }
 
-describe('Clean-Room Linux Rebuild Audit', () => {
-  it('includes all required clean-room configuration and packaging files', () => {
+describe('Clean-Room Linux Rebuild & Open-Source Release Audit', () => {
+  it('includes all required configuration, open-source documentation, and source files', () => {
     const requiredFiles = [
       '.gitignore',
       '.gitattributes',
@@ -34,6 +34,8 @@ describe('Clean-Room Linux Rebuild Audit', () => {
       '.nvmrc',
       '.env.example',
       'Dockerfile',
+      'LICENSE',
+      'CONTRIBUTING.md',
       'README.md',
       'package.json',
       'package-lock.json',
@@ -48,7 +50,6 @@ describe('Clean-Room Linux Rebuild Audit', () => {
       'src/engine/raceDetector.ts',
       'src/engine/simulator.ts',
       'src/engine/remediator.ts',
-      'src/scenarios/presets.ts',
       'src/server/app.ts',
       'src/server/index.ts',
       'src/client/main.tsx',
@@ -58,6 +59,7 @@ describe('Clean-Room Linux Rebuild Audit', () => {
       'src/client/components/CodeAndDiffPanel.tsx',
       'src/client/components/ChaosBenchmarkBar.tsx',
       'src/client/components/CustomTraceModal.tsx',
+      'tests/fixtures/traces.ts',
       'tests/engine.test.ts',
       'tests/api.test.ts',
       'tests/linux-rebuild-audit.test.ts',
@@ -66,6 +68,8 @@ describe('Clean-Room Linux Rebuild Audit', () => {
     for (const file of requiredFiles) {
       expect(existsSync(resolve(REPO_ROOT, file)), `Missing required file: ${file}`).toBe(true);
     }
+
+    expect(existsSync(resolve(REPO_ROOT, 'src/scenarios/presets.ts'))).toBe(false);
   });
 
   it('pins Node.js runtime in .nvmrc and package.json engines', () => {
@@ -126,25 +130,20 @@ describe('Clean-Room Linux Rebuild Audit', () => {
     expect(envExample).toContain('SIMULATION_WORKERS=500');
   });
 
-  it('documents architecture, algorithms, setup, test, Docker, and all 6 milestones in README.md', () => {
+  it('includes MIT LICENSE, CONTRIBUTING.md, and comprehensive open-source README.md', () => {
+    const license = readFileSync(resolve(REPO_ROOT, 'LICENSE'), 'utf8');
+    expect(license).toContain('MIT License');
+
+    const contributing = readFileSync(resolve(REPO_ROOT, 'CONTRIBUTING.md'), 'utf8');
+    expect(contributing).toContain('LockEvent');
+    expect(contributing).toContain('npm test');
+
     const readme = readFileSync(resolve(REPO_ROOT, 'README.md'), 'utf8');
     expect(readme).toContain('Tarjan');
     expect(readme).toContain('Vector Clock');
-    expect(readme).toContain('cp .env.example .env && npm ci && npm run build && npm start');
+    expect(readme).toContain('POST /api/analyze');
     expect(readme).toContain('npm test');
-    expect(readme).toContain(
-      'docker build -t deadlock-zero . && docker run --rm -p 3000:3000 --env-file .env.example deadlock-zero',
-    );
-    expect(readme).toContain('Milestone 1: Core Wait-For Graph (WFG) Data Structures & Runtime Pinning');
-    expect(readme).toContain("Milestone 2: Tarjan's SCC Deadlock Detector & Lamport Vector-Clock Race Verifier");
-    expect(readme).toContain(
-      'Milestone 3: 500-Worker Chaos Simulator, Canonical Lock-Order Remediator & 5 Outage Scenarios',
-    );
-    expect(readme).toContain('Milestone 4: Express REST API & Custom Lock-Trace Parser');
-    expect(readme).toContain(
-      'Milestone 5: Interactive Dark-Mode SRE War-Room Dashboard (React + Tailwind + SVG Graph)',
-    );
-    expect(readme).toContain('Milestone 6: Clean-Room Linux Dockerization & Automated Rebuild Audit');
+    expect(readme).toContain('docker build -t deadlock-zero .');
   });
 
   it('contains zero hardcoded host machine paths or secrets across the entire repository', () => {
