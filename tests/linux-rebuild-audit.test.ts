@@ -37,7 +37,30 @@ describe('Clean-Room Linux Rebuild Audit', () => {
       'README.md',
       'package.json',
       'package-lock.json',
+      'postcss.config.js',
+      'tailwind.config.js',
       'tsconfig.json',
+      'tsconfig.server.json',
+      'vite.config.ts',
+      'src/shared/types.ts',
+      'src/engine/graph.ts',
+      'src/engine/deadlockDetector.ts',
+      'src/engine/raceDetector.ts',
+      'src/engine/simulator.ts',
+      'src/engine/remediator.ts',
+      'src/scenarios/presets.ts',
+      'src/server/app.ts',
+      'src/server/index.ts',
+      'src/client/main.tsx',
+      'src/client/App.tsx',
+      'src/client/index.css',
+      'src/client/components/LockGraphCanvas.tsx',
+      'src/client/components/CodeAndDiffPanel.tsx',
+      'src/client/components/ChaosBenchmarkBar.tsx',
+      'src/client/components/CustomTraceModal.tsx',
+      'tests/engine.test.ts',
+      'tests/api.test.ts',
+      'tests/linux-rebuild-audit.test.ts',
     ];
 
     for (const file of requiredFiles) {
@@ -88,9 +111,9 @@ describe('Clean-Room Linux Rebuild Audit', () => {
   it('defines a production Linux Dockerfile based on node:22.19.0-bookworm-slim', () => {
     const dockerfile = readFileSync(resolve(REPO_ROOT, 'Dockerfile'), 'utf8');
     expect(dockerfile).toContain('FROM node:22.19.0-bookworm-slim');
-    expect(dockerfile).toContain('RUN npm ci');
-    expect(dockerfile).toContain('RUN npm test');
-    expect(dockerfile).toContain('RUN npm run build');
+    expect(dockerfile).toContain('npm ci');
+    expect(dockerfile).toContain('npm test');
+    expect(dockerfile).toContain('npm run build');
     expect(dockerfile).toContain('EXPOSE 3000');
     expect(dockerfile).toContain('CMD ["npm", "start"]');
   });

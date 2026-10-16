@@ -41,7 +41,7 @@ export interface CanonicalLockOrderingPatch {
   readonly diffText: string;
 }
 
-export interface RemediationResult extends CanonicalLockOrderingPatch, RemediationPlan {
+export interface RemediationResult extends CanonicalLockOrderingPatch {
   /** Markdown headed exactly as a 3 a.m. operator checklist. */
   readonly runbook: string;
   readonly runbookMarkdown: string;
