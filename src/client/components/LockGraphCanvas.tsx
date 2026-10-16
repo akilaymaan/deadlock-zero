@@ -1,16 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import {
-  AlertOctagon,
-  AlertTriangle,
-  Cpu,
-  Info,
-  Lock,
-  Maximize2,
-  Network,
-  ShieldCheck,
-  ZoomIn,
-  ZoomOut,
-} from 'lucide-react';
+import { Maximize2, Network, ZoomIn, ZoomOut } from 'lucide-react';
 import type {
   DeadlockCycle,
   GraphEdge,
@@ -39,25 +28,23 @@ interface PositionedNode extends GraphNode {
 export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
   nodes,
   edges,
-  events = [],
   cycles,
-  races,
-  starvation,
   selectedNodeId,
   onSelectNode,
 }) => {
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [zoom, setZoom] = useState<number>(1);
 
-  const width = 820;
-  const height = 440;
+  const width = 860;
+  const height = 520;
   const centerX = width / 2;
-  const centerY = height / 2 + 4;
+  const centerY = height / 2 - 6;
 
+  // Space nodes generously so labels and edges never crowd each other
   const positionedNodes: PositionedNode[] = useMemo(() => {
     const count = Math.max(nodes.length, 1);
-    const radiusX = Math.min(265, 120 + count * 22);
-    const radiusY = Math.min(148, 84 + count * 13);
+    const radiusX = Math.min(285, 165 + count * 22);
+    const radiusY = Math.min(175, 115 + count * 14);
     return nodes.map((node, index) => {
       const angle = (2 * Math.PI * index) / count - Math.PI / 2;
       return {
@@ -82,167 +69,68 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
     return nodeMap.get(targetId) ?? null;
   }, [hoveredNodeId, selectedNodeId, nodeMap]);
 
-  const activeNodeDetails = useMemo(() => {
-    if (!activeNode) return null;
-    const connectedEdges = edges.filter(
-      (e) => e.from === activeNode.id || e.to === activeNode.id,
-    );
-    const relatedEvents = events.filter(
-      (ev) => ev.workerId === activeNode.id || ev.resourceId === activeNode.id,
-    );
-    return {
-      connectedEdges,
-      relatedEvents,
-    };
-  }, [activeNode, edges, events]);
-
-  const primaryCyclePath = cycles[0]?.cycleNodes?.join(' → ');
   const hasDeadlock = cycles.length > 0;
-  const hasRace = races.length > 0;
-  const hasStarvation = starvation.length > 0;
-
-  const panelBorderClass = hasDeadlock
-    ? 'border-rose-500/40'
-    : hasRace || hasStarvation
-      ? 'border-amber-500/30'
-      : 'border-slate-800/80';
 
   return (
-    <div
-      className={`flex flex-col h-full bg-slate-900/75 backdrop-blur-md border rounded-xl shadow-xl overflow-hidden transition-all duration-300 ease-out ${panelBorderClass}`}
-    >
-      {/* Standardized h-12 Header Bar */}
-      <div className="h-12 px-4 flex items-center justify-between gap-3 border-b border-slate-800/80 bg-slate-950/60 shrink-0">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-7 h-7 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center shrink-0">
+    <div className="flex flex-col h-full min-h-[520px] bg-slate-900/50 border border-slate-800/60 rounded-2xl shadow-xl overflow-hidden">
+      {/* Clean Header Bar */}
+      <div className="px-6 py-4 flex items-center justify-between gap-4 border-b border-slate-800/60 bg-slate-950/40">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center shrink-0">
             <Network className="w-4 h-4 text-cyan-400" />
           </div>
-          <h2 className="text-xs font-bold tracking-wider uppercase text-slate-100 truncate">
-            Wait-For Graph (WFG) // Tarjan&apos;s SCC Topology
-          </h2>
+          <div>
+            <h2 className="text-sm font-bold text-slate-100">
+              Visual Lock Map
+            </h2>
+            <p className="text-xs text-slate-400">
+              Click any worker or lock resource to highlight its connections
+            </p>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
-          {/* Zoom Controls */}
-          <div className="hidden sm:flex items-center gap-1 bg-slate-950/90 border border-slate-800/80 rounded-lg p-0.5">
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.max(0.75, Number((z - 0.12).toFixed(2))))}
-              disabled={zoom <= 0.75}
-              title="Zoom Out"
-              aria-label="Zoom Out"
-              className="p-1.5 rounded-md text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
-            <span className="px-1.5 text-[11px] font-mono tabular-nums text-slate-300">
-              {Math.round(zoom * 100)}%
-            </span>
-            <button
-              type="button"
-              onClick={() => setZoom((z) => Math.min(1.35, Number((z + 0.12).toFixed(2))))}
-              disabled={zoom >= 1.35}
-              title="Zoom In"
-              aria-label="Zoom In"
-              className="p-1.5 rounded-md text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setZoom(1);
-                onSelectNode(null);
-              }}
-              title="Reset Graph View"
-              aria-label="Reset Graph View"
-              className="p-1.5 rounded-md text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-            </button>
-          </div>
-
-          {/* Semantic Status Badge */}
-          {hasDeadlock ? (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono tabular-nums font-semibold bg-rose-500/10 text-rose-400 border border-rose-500/40">
-              <span className="w-2 h-2 rounded-full bg-rose-500 animate-ping" />
-              {cycles.length} SCC CYCLE
-            </span>
-          ) : hasRace ? (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono tabular-nums font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/30">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              {races.length} VECTOR RACE
-            </span>
-          ) : hasStarvation ? (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono tabular-nums font-semibold bg-amber-500/10 text-amber-400 border border-amber-500/30">
-              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              STARVATION (&gt;80%)
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-mono tabular-nums font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-              <span className="w-2 h-2 rounded-full bg-emerald-400" />
-              DAG SAFE
-            </span>
-          )}
+        {/* Zoom Controls */}
+        <div className="flex items-center gap-1.5 bg-slate-950/80 border border-slate-800/60 rounded-xl p-1">
+          <button
+            type="button"
+            onClick={() => setZoom((z) => Math.max(0.75, Number((z - 0.12).toFixed(2))))}
+            disabled={zoom <= 0.75}
+            title="Zoom Out"
+            aria-label="Zoom Out"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
+          >
+            <ZoomOut className="w-4 h-4" />
+          </button>
+          <span className="px-2 text-xs font-mono tabular-nums text-slate-300">
+            {Math.round(zoom * 100)}%
+          </span>
+          <button
+            type="button"
+            onClick={() => setZoom((z) => Math.min(1.35, Number((z + 0.12).toFixed(2))))}
+            disabled={zoom >= 1.35}
+            title="Zoom In"
+            aria-label="Zoom In"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
+          >
+            <ZoomIn className="w-4 h-4" />
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setZoom(1);
+              onSelectNode(null);
+            }}
+            title="Reset View"
+            aria-label="Reset View"
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-100 hover:bg-slate-800/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
+          >
+            <Maximize2 className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
-      {/* Semantic Live Alert Banner */}
-      {primaryCyclePath ? (
-        <div
-          role="alert"
-          className="flex items-center justify-between gap-3 px-4 py-2 bg-rose-500/10 border-b border-rose-500/40 text-rose-400 text-xs font-mono shrink-0"
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <AlertOctagon className="w-4 h-4 text-rose-400 shrink-0" />
-            <span className="font-bold uppercase tracking-wider shrink-0">
-              Tarjan SCC Deadlock Cycle:
-            </span>
-            <span className="truncate text-slate-100 font-semibold">{primaryCyclePath}</span>
-          </div>
-          <span className="text-[10px] px-2 py-0.5 rounded bg-rose-500/15 border border-rose-500/40 text-rose-300 shrink-0 tabular-nums">
-            O(V + E) Verified
-          </span>
-        </div>
-      ) : hasRace ? (
-        <div
-          role="alert"
-          className="flex items-center justify-between gap-3 px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-xs font-mono shrink-0"
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span className="font-bold uppercase tracking-wider shrink-0">
-              Lamport Vector-Clock Conflict:
-            </span>
-            <span className="truncate text-slate-100">
-              {races[0].workerA} || {races[0].workerB} on {races[0].resourceId}
-            </span>
-          </div>
-        </div>
-      ) : hasStarvation ? (
-        <div
-          role="alert"
-          className="flex items-center justify-between gap-3 px-4 py-2 bg-amber-500/10 border-b border-amber-500/30 text-amber-400 text-xs font-mono shrink-0"
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span className="font-bold uppercase tracking-wider shrink-0">
-              Pool Starvation:
-            </span>
-            <span className="truncate text-slate-100">{starvation[0].explanation}</span>
-          </div>
-        </div>
-      ) : (
-        <div className="flex items-center gap-2 px-4 py-2 bg-emerald-500/10 border-b border-emerald-500/30 text-emerald-400 text-xs font-mono shrink-0">
-          <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span className="truncate text-slate-100">
-            Cycle-Free Canonical Lock Hierarchy Verified — 0 Strongly Connected Deadlock Components
-          </span>
-        </div>
-      )}
-
-      {/* Radial Dot-Matrix Graph Viewport */}
-      <div className="relative flex-1 min-h-[360px] sre-dot-matrix flex items-center justify-center overflow-hidden">
+      {/* Spacious SVG Viewport */}
+      <div className="relative flex-1 min-h-[460px] sre-dot-matrix flex items-center justify-center overflow-hidden">
         <svg
           viewBox={`0 0 ${width} ${height}`}
           className="w-full h-full select-none"
@@ -250,22 +138,21 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
         >
           <defs>
             <filter id="glow-rose" x="-40%" y="-40%" width="180%" height="180%">
-              <feGaussianBlur stdDeviation="4" result="blur" />
+              <feGaussianBlur stdDeviation="5" result="blur" />
               <feComposite in="SourceGraphic" in2="blur" operator="over" />
             </filter>
             <filter id="glow-cyan" x="-40%" y="-40%" width="180%" height="180%">
-              <feGaussianBlur stdDeviation="3" result="blur" />
+              <feGaussianBlur stdDeviation="4" result="blur" />
               <feComposite in="SourceGraphic" in2="blur" operator="over" />
             </filter>
-            {/* Exact userSpaceOnUse markers so arrowheads never clip or detach during zoom or hover */}
             <marker
               id="arrow-cycle"
               markerUnits="userSpaceOnUse"
               viewBox="0 0 12 12"
               refX="10"
               refY="6"
-              markerWidth="11"
-              markerHeight="11"
+              markerWidth="12"
+              markerHeight="12"
               orient="auto-start-reverse"
             >
               <path d="M 1 2 L 11 6 L 1 10 z" fill="#f43f5e" fillOpacity="1" />
@@ -276,8 +163,8 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
               viewBox="0 0 12 12"
               refX="10"
               refY="6"
-              markerWidth="10"
-              markerHeight="10"
+              markerWidth="11"
+              markerHeight="11"
               orient="auto-start-reverse"
             >
               <path d="M 1 2 L 11 6 L 1 10 z" fill="#10b981" fillOpacity="1" />
@@ -288,8 +175,8 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
               viewBox="0 0 12 12"
               refX="10"
               refY="6"
-              markerWidth="10"
-              markerHeight="10"
+              markerWidth="11"
+              markerHeight="11"
               orient="auto-start-reverse"
             >
               <path d="M 1 2 L 11 6 L 1 10 z" fill="#f59e0b" fillOpacity="1" />
@@ -322,10 +209,10 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
               const nx = -uy;
               const ny = ux;
 
-              const padStart = source.type === 'WORKER' ? 32 : 46;
-              const padEnd = target.type === 'WORKER' ? 36 : 50;
+              const padStart = source.type === 'WORKER' ? 42 : 58;
+              const padEnd = target.type === 'WORKER' ? 46 : 62;
 
-              const curveOffset = hasReverseEdge ? 26 : 0;
+              const curveOffset = hasReverseEdge ? 32 : 0;
               const startX = source.x + ux * padStart + nx * (curveOffset * 0.25);
               const startY = source.y + uy * padStart + ny * (curveOffset * 0.25);
               const endX = target.x - ux * padEnd + nx * (curveOffset * 0.25);
@@ -348,7 +235,8 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                   : 'url(#arrow-waits)';
 
               const pathData = `M ${startX} ${startY} Q ${ctrlX} ${ctrlY} ${endX} ${endY}`;
-              const shortFile = edge.file.split('/').pop() ?? edge.file;
+              const friendlyRelation =
+                edge.relation === 'HOLDS' ? 'holds lock' : 'waiting for';
 
               return (
                 <g key={`${edge.from}->${edge.to}:${edge.relation}:${idx}`}>
@@ -357,8 +245,8 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                       d={pathData}
                       fill="none"
                       stroke="#f43f5e"
-                      strokeWidth={6}
-                      strokeOpacity={0.16}
+                      strokeWidth={7}
+                      strokeOpacity={0.14}
                     />
                   )}
                   <path
@@ -366,7 +254,7 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                     fill="none"
                     stroke={stroke}
                     strokeOpacity={1}
-                    strokeWidth={edge.inCycle ? 2.5 : 2}
+                    strokeWidth={edge.inCycle ? 3 : 2.25}
                     className={
                       edge.inCycle
                         ? 'animate-dash-flow'
@@ -378,30 +266,30 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                   />
                   <g transform={`translate(${labelX}, ${labelY})`}>
                     <rect
-                      x={-58}
-                      y={-10}
-                      width={116}
-                      height={16}
-                      rx={4}
+                      x={-52}
+                      y={-11}
+                      width={104}
+                      height={19}
+                      rx={6}
                       fill="#090D16"
-                      fillOpacity={0.92}
+                      fillOpacity={0.94}
                       stroke={stroke}
                       strokeOpacity={0.45}
                       strokeWidth={1}
                     />
                     <text
-                      y={1}
+                      y={2}
                       textAnchor="middle"
-                      className="text-[9.5px] font-mono tabular-nums fill-slate-200 pointer-events-none"
+                      className="text-[10.5px] font-sans font-medium fill-slate-200 pointer-events-none"
                     >
-                      {edge.relation} · {shortFile}:{edge.line}
+                      {friendlyRelation} (L{edge.line})
                     </text>
                   </g>
                 </g>
               );
             })}
 
-            {/* Worker & Lock Nodes */}
+            {/* Large, Spacious Worker & Lock Nodes */}
             {positionedNodes.map((node) => {
               const isSelected = selectedNodeId === node.id;
               const isHovered = hoveredNodeId === node.id;
@@ -410,7 +298,7 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
               const strokeColor = node.inCycle
                 ? '#f43f5e'
                 : node.type === 'WORKER'
-                  ? '#22d3ee'
+                  ? '#38bdf8'
                   : '#f59e0b';
               const fillColor = node.inCycle
                 ? '#3b0718'
@@ -430,32 +318,32 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                   {node.inCycle &&
                     (node.type === 'WORKER' ? (
                       <circle
-                        r={37}
+                        r={46}
                         fill="none"
                         stroke="#f43f5e"
-                        strokeWidth={1.75}
+                        strokeWidth={2}
                         className="animate-node-ring pointer-events-none"
                       />
                     ) : (
                       <rect
-                        x={-60}
-                        y={-29}
-                        width={120}
-                        height={58}
-                        rx={12}
+                        x={-70}
+                        y={-34}
+                        width={140}
+                        height={68}
+                        rx={14}
                         fill="none"
                         stroke="#f43f5e"
-                        strokeWidth={1.75}
+                        strokeWidth={2}
                         className="animate-node-ring pointer-events-none"
                       />
                     ))}
 
                   {node.type === 'WORKER' ? (
                     <circle
-                      r={30}
+                      r={38}
                       fill={fillColor}
                       stroke={strokeColor}
-                      strokeWidth={isHighlighted || node.inCycle ? 2.75 : 2}
+                      strokeWidth={isHighlighted || node.inCycle ? 3 : 2.25}
                       filter={
                         node.inCycle
                           ? 'url(#glow-rose)'
@@ -466,31 +354,31 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                     />
                   ) : (
                     <rect
-                      x={-52}
-                      y={-23}
-                      width={104}
-                      height={46}
-                      rx={9}
+                      x={-62}
+                      y={-27}
+                      width={124}
+                      height={54}
+                      rx={12}
                       fill={fillColor}
                       stroke={strokeColor}
-                      strokeWidth={isHighlighted || node.inCycle ? 2.75 : 2}
+                      strokeWidth={isHighlighted || node.inCycle ? 3 : 2.25}
                       filter={node.inCycle ? 'url(#glow-rose)' : undefined}
                     />
                   )}
 
                   <text
-                    y={-3}
+                    y={-2}
                     textAnchor="middle"
-                    className="text-[11px] font-mono font-bold fill-slate-100 pointer-events-none"
+                    className="text-xs font-mono font-bold fill-slate-100 pointer-events-none"
                   >
                     {node.label}
                   </text>
                   <text
-                    y={11}
+                    y={13}
                     textAnchor="middle"
-                    className="text-[9px] font-mono uppercase tracking-wider fill-slate-400 pointer-events-none"
+                    className="text-[10px] font-sans font-medium fill-slate-400 pointer-events-none"
                   >
-                    {node.type === 'WORKER' ? 'WORKER' : 'LOCK'}
+                    {node.type === 'WORKER' ? 'Worker' : 'Shared Lock'}
                   </text>
                 </g>
               );
@@ -498,88 +386,44 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
           </g>
         </svg>
 
-        {/* Non-Clipping Floating Forensic Inspector Tooltip (pointer-events-none prevents hover loop) */}
-        {activeNode && activeNodeDetails && (
-          <div className="absolute top-3 left-3 z-20 w-72 max-w-[calc(100%-1.5rem)] p-3 rounded-xl bg-slate-900/95 border border-slate-700/90 shadow-2xl backdrop-blur-md text-xs font-mono space-y-2 pointer-events-none transition-all duration-200 ease-out">
-            <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-1.5">
-              <div className="flex items-center gap-1.5 min-w-0">
-                {activeNode.type === 'WORKER' ? (
-                  <Cpu className="w-4 h-4 text-cyan-400 shrink-0" />
-                ) : (
-                  <Lock className="w-4 h-4 text-amber-400 shrink-0" />
-                )}
-                <span className="font-bold text-slate-100 truncate">{activeNode.label}</span>
-              </div>
-              <span
-                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0 ${
-                  activeNode.inCycle
-                    ? 'bg-rose-500/10 text-rose-400 border border-rose-500/40'
-                    : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/30'
-                }`}
-              >
-                {activeNode.inCycle ? 'IN SCC CYCLE' : 'ACYCLIC'}
-              </span>
-            </div>
-
-            <div className="space-y-1 text-[11px] tabular-nums">
-              <div className="text-slate-400">
-                Connected Edges ({activeNodeDetails.connectedEdges.length}):
-              </div>
-              {activeNodeDetails.connectedEdges.length === 0 ? (
-                <div className="text-slate-500">No active hold/wait edges</div>
-              ) : (
-                activeNodeDetails.connectedEdges.map((edge, i) => (
-                  <div key={i} className="text-slate-200 truncate">
-                    • {edge.from}{' '}
-                    <span
-                      className={
-                        edge.inCycle
-                          ? 'text-rose-400'
-                          : edge.relation === 'HOLDS'
-                            ? 'text-emerald-400'
-                            : 'text-amber-400'
-                      }
-                    >
-                      [{edge.relation}]
-                    </span>{' '}
-                    → {edge.to} ({edge.file.split('/').pop()}:{edge.line})
-                  </div>
-                ))
-              )}
-            </div>
+        {/* Subtle Hover Pill (Top-Left, non-clipping & pointer-events-none) */}
+        {activeNode && (
+          <div className="absolute top-4 left-4 z-20 px-3.5 py-2 rounded-xl bg-slate-900/95 border border-slate-700/80 shadow-xl backdrop-blur-md text-xs pointer-events-none flex items-center gap-2.5">
+            <span
+              className={`w-2.5 h-2.5 rounded-full ${
+                activeNode.inCycle
+                  ? 'bg-rose-500'
+                  : activeNode.type === 'WORKER'
+                    ? 'bg-sky-400'
+                    : 'bg-amber-400'
+              }`}
+            />
+            <span className="font-mono font-bold text-slate-100">{activeNode.label}</span>
+            <span className="text-slate-400">•</span>
+            <span className={activeNode.inCycle ? 'text-rose-400 font-semibold' : 'text-emerald-400'}>
+              {activeNode.inCycle ? 'Stuck in Deadlock Loop' : 'Healthy / Acyclic'}
+            </span>
           </div>
         )}
 
-        {/* Bottom Legend & Counter Bar */}
-        <div className="absolute bottom-3 left-3 right-3 flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 rounded-lg bg-slate-900/90 border border-slate-800/80 backdrop-blur-md text-[11px] font-mono tabular-nums text-slate-300 pointer-events-none">
-          <div className="flex flex-wrap items-center gap-3.5">
-            <span className="flex items-center gap-1.5">
-              <span className="w-2.5 h-2.5 rounded-full bg-cyan-400 inline-block" />
-              Worker
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-3 h-2.5 rounded-xs bg-amber-400 inline-block" />
-              Lock Resource
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-4 h-0.5 bg-emerald-400 inline-block" />
-              HOLDS (#10b981)
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-4 h-0.5 border-b-2 border-dashed border-amber-400 inline-block" />
-              WAITS_FOR (#f59e0b)
-            </span>
-            <span className="flex items-center gap-1.5">
-              <span className="w-4 h-0.5 bg-rose-500 inline-block" />
-              SCC Cycle (#f43f5e)
-            </span>
-          </div>
-          <div className="flex items-center gap-1.5 text-slate-400">
-            <Info className="w-4 h-4 text-cyan-400" />
-            <span>
-              Nodes: {nodes.length} · Edges: {edges.length} · Cycles: {cycles.length}
-            </span>
-          </div>
+        {/* Simple 3-Item Legend in the Bottom-Left Corner */}
+        <div className="absolute bottom-4 left-4 flex flex-wrap items-center gap-4 px-4 py-2.5 rounded-xl bg-slate-900/90 border border-slate-800/70 backdrop-blur-md text-xs text-slate-200 pointer-events-none shadow-lg">
+          <span className="flex items-center gap-2">
+            <span className="w-3 h-3 rounded-full bg-sky-400 inline-block" />
+            Worker / Service
+          </span>
+          <span className="flex items-center gap-2">
+            <span className="w-3 h-3 rounded-xs bg-amber-400 inline-block" />
+            Shared Resource / Lock
+          </span>
+          <span className="flex items-center gap-2">
+            <span
+              className={`w-3 h-3 rounded-full inline-block ${
+                hasDeadlock ? 'bg-rose-500 animate-pulse' : 'bg-rose-500/70'
+              }`}
+            />
+            Deadlock Loop
+          </span>
         </div>
       </div>
     </div>

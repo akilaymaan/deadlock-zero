@@ -1,18 +1,18 @@
 import React, { useMemo, useRef, useState } from 'react';
 import {
-  Activity,
-  Check,
-  Code2,
-  Copy,
+  AlertTriangle,
+  ArrowRight,
+  BookOpen,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   FileJson,
   FileUp,
-  GitBranch,
-  Loader2,
-  Play,
+  Flame,
+  Network,
   ShieldAlert,
-  Sparkles,
   Terminal,
-  Trash2,
+  Wrench,
 } from 'lucide-react';
 import { buildWaitForGraph } from '../engine/graph';
 import { detectDeadlocks } from '../engine/deadlockDetector';
@@ -29,39 +29,87 @@ import {
   SAMPLE_SCHEMA_TEMPLATE,
 } from './components/CustomTraceModal';
 
-const CURL_INGEST_SNIPPET = `curl -X POST http://localhost:3000/api/analyze \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "events": [
-      {
-        "id": "evt-1",
-        "workerId": "Worker_1",
-        "resourceId": "Lock_A",
-        "action": "ACQUIRE",
-        "timestamp": 1001,
-        "vectorClock": { "Worker_1": 1, "Worker_2": 0 },
-        "file": "src/services/ledger.ts",
-        "line": 41,
-        "codeSnippet": "await tx.acquireRowLock(fromAccountId);"
-      }
-    ]
-  }'`;
+type WorkspaceStep = 'diagnose' | 'fix' | 'stress';
+
+interface StoryStep {
+  stepNumber: number;
+  title: string;
+  description: string;
+  fileLine: string;
+  isFreezeStep: boolean;
+}
+
+function buildHumanStoryTimeline(events: LockEvent[], hasCycle: boolean): StoryStep[] {
+  const steps: StoryStep[] = [];
+  const acquires = events.filter((e) => e.action === 'ACQUIRE');
+  const waits = events.filter((e) => e.action === 'WAIT');
+
+  acquires.forEach((ev, idx) => {
+    const shortFile = ev.file.split('/').pop() ?? ev.file;
+    steps.push({
+      stepNumber: idx + 1,
+      title: `${ev.workerId} locked ${ev.resourceId}`,
+      description: `${ev.workerId} acquired exclusive ownership of ${ev.resourceId} at ${shortFile}:${ev.line}.`,
+      fileLine: `${shortFile}:${ev.line}`,
+      isFreezeStep: false,
+    });
+  });
+
+  if (waits.length > 0 && hasCycle) {
+    const waiters = [...new Set(waits.map((w) => w.workerId))].join(' and ');
+    const targetLocks = [...new Set(waits.map((w) => w.resourceId))].join(' & ');
+    const firstWait = waits[0];
+    const shortFile = firstWait.file.split('/').pop() ?? firstWait.file;
+    steps.push({
+      stepNumber: steps.length + 1,
+      title: 'Both workers tried to grab the other’s lock and froze',
+      description: `${waiters} requested ${targetLocks} while still holding their first lock, creating an unbreakable circular wait.`,
+      fileLine: `${shortFile}:${firstWait.line}`,
+      isFreezeStep: true,
+    });
+  } else {
+    waits.forEach((ev) => {
+      const shortFile = ev.file.split('/').pop() ?? ev.file;
+      steps.push({
+        stepNumber: steps.length + 1,
+        title: `${ev.workerId} waited for ${ev.resourceId}`,
+        description: `${ev.workerId} queued in safe order for ${ev.resourceId} without forming a loop.`,
+        fileLine: `${shortFile}:${ev.line}`,
+        isFreezeStep: false,
+      });
+    });
+  }
+
+  if (steps.length === 0) {
+    events.forEach((ev, idx) => {
+      const shortFile = ev.file.split('/').pop() ?? ev.file;
+      steps.push({
+        stepNumber: idx + 1,
+        title: `${ev.workerId} performed ${ev.action} on ${ev.resourceId}`,
+        description: `Executed ${ev.codeSnippet} at ${shortFile}:${ev.line}.`,
+        fileLine: `${shortFile}:${ev.line}`,
+        isFreezeStep: ev.action === 'WRITE',
+      });
+    });
+  }
+
+  return steps;
+}
 
 export const App: React.FC = () => {
-  const [traceEvents, setTraceEvents] = useState<LockEvent[]>([]);
-  const [traceSourceLabel, setTraceSourceLabel] = useState<string>('Empty Workspace');
+  const [activeStep, setActiveStep] = useState<WorkspaceStep>('diagnose');
+  const [traceEvents, setTraceEvents] = useState<LockEvent[]>(SAMPLE_SCHEMA_TEMPLATE);
+  const [traceSourceLabel, setTraceSourceLabel] = useState<string>('Sample Trace (ledger.ts)');
   const [uploadError, setUploadError] = useState<string | null>(null);
-  const [isDraggingOver, setIsDraggingOver] = useState(false);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isReplaying, setIsReplaying] = useState(false);
   const [replayCount, setReplayCount] = useState(0);
-  const [copiedCurl, setCopiedCurl] = useState(false);
+  const [showAdvancedMath, setShowAdvancedMath] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const analysis = useMemo(() => {
-    if (traceEvents.length === 0) return null;
     const graph = buildWaitForGraph(traceEvents);
     const cycles = detectDeadlocks(graph);
     const races = detectRaces(traceEvents);
@@ -76,6 +124,8 @@ export const App: React.FC = () => {
     }));
     const remediation = generateRemediationPlan(traceEvents, cycles, races);
     const benchmark = runChaosBenchmark(traceEvents, 500);
+    const storySteps = buildHumanStoryTimeline(traceEvents, cycles.length > 0);
+
     return {
       graph,
       cycles,
@@ -83,6 +133,7 @@ export const App: React.FC = () => {
       starvation,
       remediation,
       benchmark,
+      storySteps,
     };
   }, [traceEvents, replayCount]);
 
@@ -124,15 +175,16 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleCopyCurl = async () => {
-    try {
-      await navigator.clipboard.writeText(CURL_INGEST_SNIPPET);
-    } catch {
-      // Headless environment fallback
-    }
-    setCopiedCurl(true);
-    setTimeout(() => setCopiedCurl(false), 2000);
-  };
+  const primaryFile = (traceEvents[0]?.file ?? 'ledger.ts').split('/').pop() ?? 'ledger.ts';
+  const hasDeadlock = analysis.cycles.length > 0;
+  const hasRace = analysis.races.length > 0;
+  const stuckWorkerCount = hasDeadlock ? analysis.cycles[0].cycle.length : 0;
+
+  const plainEnglishSummary = hasDeadlock
+    ? `Deadlock Detected: ${stuckWorkerCount} workers are stuck waiting on each other in a circle. Suggested Fix: Enforce canonical lock ordering in ${primaryFile}.`
+    : hasRace
+      ? `Race Condition Detected: Workers are concurrently overwriting shared state in ${primaryFile} without a common lock.`
+      : `All Clear: Workers acquire locks in a safe, consistent order in ${primaryFile} with zero circular waits.`;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col overflow-x-hidden">
@@ -150,296 +202,346 @@ export const App: React.FC = () => {
         }}
       />
 
-      {/* Top Studio Navigation Bar */}
-      <header className="border-b border-slate-800/80 bg-slate-900/75 backdrop-blur-md px-4 lg:px-6 py-3 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-9 h-9 rounded-xl bg-rose-500/10 border border-rose-500/40 flex items-center justify-center shrink-0">
-            <ShieldAlert className="w-4 h-4 text-rose-400" />
-          </div>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-sm sm:text-base font-bold tracking-tight text-slate-100 truncate">
-                DeadlockZero // Concurrency &amp; Outage Forensics Workbench
-              </h1>
-              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 shrink-0">
-                <Sparkles className="w-3.5 h-3.5" /> 100% Offline Deterministic
-              </span>
+      {/* Friendly Top Header Bar */}
+      <header className="border-b border-slate-800/60 bg-slate-900/50 backdrop-blur-md sticky top-0 z-30">
+        <div className="max-w-7xl mx-auto px-6 py-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <div className="w-10 h-10 rounded-xl bg-rose-500/10 border border-rose-500/30 flex items-center justify-center shrink-0">
+              <ShieldAlert className="w-5 h-5 text-rose-400" />
             </div>
-            <p className="text-xs text-slate-400 truncate">
-              Tarjan&apos;s SCC Cycle Detector • Lamport Vector-Clock Verifier • 500-Worker Chaos Simulator
-            </p>
+            <div>
+              <div className="flex items-center gap-2.5">
+                <h1 className="text-base font-bold tracking-tight text-slate-100">
+                  DeadlockZero
+                </h1>
+                <span className="px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-slate-800 text-slate-300 border border-slate-700/80">
+                  {traceSourceLabel}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                Find, understand, and fix concurrency lockups in 3 guided steps
+              </p>
+            </div>
           </div>
-        </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="h-9 flex items-center gap-1.5 px-3 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 text-xs font-semibold text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-          >
-            <FileUp className="w-4 h-4 text-cyan-400" />
-            Upload .json / .jsonl
-          </button>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="h-10 flex items-center gap-2 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 border border-slate-800/80 text-xs font-semibold text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] transition-all cursor-pointer"
+            >
+              <FileUp className="w-4 h-4 text-cyan-400" />
+              Upload .json / .jsonl
+            </button>
 
-          <button
-            type="button"
-            onClick={() => setIsModalOpen(true)}
-            className="h-9 flex items-center gap-1.5 px-3 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 text-xs font-semibold text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-          >
-            <Terminal className="w-4 h-4 text-cyan-400" />
-            Ingest Lock Trace
-          </button>
+            <button
+              type="button"
+              onClick={() => setIsModalOpen(true)}
+              className="h-10 flex items-center gap-2 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-semibold text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] transition-all cursor-pointer"
+            >
+              <Terminal className="w-4 h-4 text-cyan-400" />
+              Paste Custom Trace
+            </button>
 
-          {traceEvents.length > 0 && (
-            <>
-              <button
-                type="button"
-                onClick={() => {
-                  setTraceEvents([]);
-                  setTraceSourceLabel('Empty Workspace');
-                  setSelectedNodeId(null);
-                  setUploadError(null);
-                }}
-                className="h-9 flex items-center gap-1.5 px-3 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-xs font-medium text-slate-400 hover:text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-              >
-                <Trash2 className="w-4 h-4" />
-                Clear
-              </button>
-
-              <button
-                type="button"
-                onClick={handleRunChaosReplay}
-                disabled={isReplaying}
-                className="h-9 flex items-center gap-1.5 px-3.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
-              >
-                {isReplaying ? (
-                  <>
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Replaying...
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-4 h-4" />
-                    Run 500-Worker Chaos Replay
-                  </>
-                )}
-              </button>
-            </>
-          )}
+            <button
+              type="button"
+              onClick={() => {
+                setTraceEvents(SAMPLE_SCHEMA_TEMPLATE);
+                setTraceSourceLabel('Sample Trace (ledger.ts)');
+                setUploadError(null);
+              }}
+              className="h-10 flex items-center gap-2 px-3.5 rounded-xl bg-slate-900/80 hover:bg-slate-800 border border-slate-800/60 text-xs font-medium text-slate-400 hover:text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] transition-all cursor-pointer"
+            >
+              <FileJson className="w-4 h-4 text-emerald-400" />
+              Reset Sample
+            </button>
+          </div>
         </div>
       </header>
 
-      {/* Active Trace Status Strip */}
-      <div className="bg-slate-900/50 border-b border-slate-800/80 px-4 lg:px-6 py-2.5">
-        <div className="max-w-[1600px] w-full mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex flex-wrap items-center gap-2.5 min-w-0">
-            <span
-              className={`px-2 py-0.5 rounded font-mono font-bold text-[10px] uppercase shrink-0 ${
-                traceEvents.length > 0
-                  ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
-                  : 'bg-slate-800 text-slate-400 border border-slate-700'
-              }`}
-            >
-              {traceEvents.length > 0 ? 'INGESTED TRACE' : 'AWAITING TRACE'}
-            </span>
-            <span className="font-semibold text-slate-100 truncate">{traceSourceLabel}</span>
-            {uploadError && (
-              <span className="text-rose-400 font-mono truncate">• {uploadError}</span>
+      {/* Main Spacious 3-Step Container */}
+      <main className="flex-1 w-full max-w-7xl mx-auto px-6 py-8 space-y-8">
+        {uploadError && (
+          <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/40 text-rose-300 text-sm">
+            {uploadError}
+          </div>
+        )}
+
+        {/* Top Summary Banner (Always Visible & Plain-English) */}
+        <section
+          aria-label="Plain-English Incident Summary"
+          className={`rounded-2xl p-6 lg:p-8 border shadow-xl flex flex-col lg:flex-row lg:items-center justify-between gap-6 ${
+            hasDeadlock
+              ? 'bg-slate-900/60 border-rose-500/40'
+              : hasRace
+                ? 'bg-slate-900/60 border-amber-500/30'
+                : 'bg-slate-900/60 border-emerald-500/30'
+          }`}
+        >
+          <div className="space-y-2 max-w-2xl">
+            <div className="inline-flex items-center gap-2 text-xs font-bold uppercase tracking-wider">
+              {hasDeadlock ? (
+                <span className="flex items-center gap-1.5 text-rose-400">
+                  <AlertTriangle className="w-4 h-4" /> Critical Concurrency Issue Found
+                </span>
+              ) : hasRace ? (
+                <span className="flex items-center gap-1.5 text-amber-400">
+                  <AlertTriangle className="w-4 h-4" /> Data Race Warning
+                </span>
+              ) : (
+                <span className="flex items-center gap-1.5 text-emerald-400">
+                  <CheckCircle2 className="w-4 h-4" /> Lock Hierarchy Verified Safe
+                </span>
+              )}
+            </div>
+            <h2 className="text-lg sm:text-xl font-bold text-slate-100 leading-snug">
+              {plainEnglishSummary}
+            </h2>
+          </div>
+
+          {/* 3 Clean Summary Pills + Next-Step CTA */}
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            <div className="px-4 py-2.5 rounded-xl bg-slate-950/80 border border-slate-800/60">
+              <span className="text-[11px] text-slate-400 block">Active Cycles</span>
+              <strong
+                className={`text-sm font-mono tabular-nums ${
+                  analysis.cycles.length > 0 ? 'text-rose-400' : 'text-emerald-400'
+                }`}
+              >
+                {analysis.cycles.length}
+              </strong>
+            </div>
+
+            <div className="px-4 py-2.5 rounded-xl bg-slate-950/80 border border-slate-800/60">
+              <span className="text-[11px] text-slate-400 block">Race Conflicts</span>
+              <strong
+                className={`text-sm font-mono tabular-nums ${
+                  analysis.races.length > 0 ? 'text-amber-400' : 'text-emerald-400'
+                }`}
+              >
+                {analysis.races.length}
+              </strong>
+            </div>
+
+            <div className="px-4 py-2.5 rounded-xl bg-slate-950/80 border border-slate-800/60">
+              <span className="text-[11px] text-slate-400 block">System Health</span>
+              <strong
+                className={`text-sm font-semibold ${
+                  hasDeadlock ? 'text-rose-400' : hasRace ? 'text-amber-400' : 'text-emerald-400'
+                }`}
+              >
+                {hasDeadlock ? 'Blocked' : hasRace ? 'At Risk' : 'Healthy'}
+              </strong>
+            </div>
+
+            {activeStep === 'diagnose' ? (
+              <button
+                type="button"
+                onClick={() => setActiveStep('fix')}
+                className="h-11 flex items-center gap-2 px-5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shadow-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] cursor-pointer"
+              >
+                View Recommended Code Fix
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : activeStep === 'fix' ? (
+              <button
+                type="button"
+                onClick={() => setActiveStep('stress')}
+                className="h-11 flex items-center gap-2 px-5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shadow-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] cursor-pointer"
+              >
+                Verify with 500-Worker Stress Test
+                <ArrowRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setActiveStep('diagnose')}
+                className="h-11 flex items-center gap-2 px-5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] cursor-pointer"
+              >
+                Back to Visual Map
+              </button>
             )}
           </div>
+        </section>
 
-          <div className="flex items-center gap-4 text-[11px] font-mono tabular-nums text-slate-400 shrink-0">
-            <span className="flex items-center gap-1.5">
-              <GitBranch className="w-4 h-4 text-emerald-400" />
-              Events: <strong className="text-slate-200">{traceEvents.length}</strong>
-            </span>
-            <span className="flex items-center gap-1.5">
-              <Activity className="w-4 h-4 text-amber-400" />
-              Simulation Workers: <strong className="text-slate-200">500</strong>
-            </span>
-          </div>
-        </div>
-      </div>
+        {/* Segmented 3-Step View Switcher */}
+        <nav
+          aria-label="Guided 3-Step Workflow"
+          className="grid grid-cols-1 sm:grid-cols-3 gap-3 p-1.5 rounded-2xl bg-slate-900/70 border border-slate-800/60"
+        >
+          <button
+            type="button"
+            onClick={() => setActiveStep('diagnose')}
+            className={`flex items-center justify-center gap-2.5 py-3.5 px-4 rounded-xl text-sm font-bold transition-all cursor-pointer ${
+              activeStep === 'diagnose'
+                ? 'bg-cyan-500 text-slate-950 shadow-md'
+                : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/50'
+            }`}
+          >
+            <Network className="w-4 h-4" />
+            1. Diagnose (Visual Map)
+          </button>
 
-      {/* Main Workspace Area */}
-      <main className="flex-1 p-4 lg:p-5 flex flex-col gap-4 max-w-[1600px] w-full mx-auto">
-        {!analysis ? (
-          /* Clean Empty Workspace Onboarding State */
-          <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 gap-4 items-stretch">
-            {/* Drag-and-Drop / Upload Ingestion Panel */}
-            <div
-              onDragOver={(e) => {
-                e.preventDefault();
-                setIsDraggingOver(true);
-              }}
-              onDragLeave={() => setIsDraggingOver(false)}
-              onDrop={(e) => {
-                e.preventDefault();
-                setIsDraggingOver(false);
-                const file = e.dataTransfer.files?.[0];
-                if (file) {
-                  void handleFileUpload(file);
-                }
-              }}
-              className={`lg:col-span-7 bg-slate-900/75 backdrop-blur-md border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center gap-4 transition-all ${
-                isDraggingOver
-                  ? 'border-cyan-400 bg-cyan-500/5'
-                  : 'border-slate-800/80 hover:border-slate-700'
-              }`}
-            >
-              <div className="w-12 h-12 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center">
-                <FileUp className="w-6 h-6 text-cyan-400" />
-              </div>
+          <button
+            type="button"
+            onClick={() => setActiveStep('fix')}
+            className={`flex items-center justify-center gap-2.5 py-3.5 px-4 rounded-xl text-sm font-bold transition-all cursor-pointer ${
+              activeStep === 'fix'
+                ? 'bg-cyan-500 text-slate-950 shadow-md'
+                : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/50'
+            }`}
+          >
+            <Wrench className="w-4 h-4" />
+            2. Fix &amp; Runbook (Solution)
+          </button>
 
-              <div className="max-w-lg space-y-1.5">
-                <h2 className="text-base font-bold text-slate-100">
-                  Ingest a Distributed Lock or Vector-Clock Trace
-                </h2>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Drag and drop a <code className="text-cyan-300 font-mono">.json</code> or{' '}
-                  <code className="text-cyan-300 font-mono">.jsonl</code> lock trace file here, paste
-                  events directly in the Trace Editor, or POST to <code className="text-emerald-400 font-mono">/api/analyze</code>.
-                </p>
-              </div>
+          <button
+            type="button"
+            onClick={() => setActiveStep('stress')}
+            className={`flex items-center justify-center gap-2.5 py-3.5 px-4 rounded-xl text-sm font-bold transition-all cursor-pointer ${
+              activeStep === 'stress'
+                ? 'bg-cyan-500 text-slate-950 shadow-md'
+                : 'text-slate-400 hover:text-slate-100 hover:bg-slate-800/50'
+            }`}
+          >
+            <Flame className="w-4 h-4" />
+            3. Stress-Test (500-Worker Proof)
+          </button>
+        </nav>
 
-              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="h-9 flex items-center gap-1.5 px-4 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-                >
-                  <FileUp className="w-4 h-4" />
-                  Select .json / .jsonl File
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => setIsModalOpen(true)}
-                  className="h-9 flex items-center gap-1.5 px-4 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-                >
-                  <Terminal className="w-4 h-4 text-cyan-400" />
-                  Open Trace Editor
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setTraceEvents(SAMPLE_SCHEMA_TEMPLATE);
-                    setTraceSourceLabel('Sample Schema Template');
-                    setUploadError(null);
-                  }}
-                  className="h-9 flex items-center gap-1.5 px-3.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-xs font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
-                >
-                  <FileJson className="w-4 h-4 text-emerald-400" />
-                  Load Sample Schema Template
-                </button>
-              </div>
+        {/* STEP 1 VIEW: 1. Diagnose (Visual Map + Plain-English Story Sidebar) */}
+        {activeStep === 'diagnose' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
+            {/* 70% Width Wait-For Graph */}
+            <div className="lg:col-span-8 flex flex-col">
+              <LockGraphCanvas
+                nodes={analysis.graph.nodes}
+                edges={analysis.graph.edges}
+                events={traceEvents}
+                cycles={analysis.cycles}
+                races={analysis.races}
+                starvation={analysis.starvation}
+                selectedNodeId={selectedNodeId}
+                onSelectNode={setSelectedNodeId}
+              />
             </div>
 
-            {/* Schema & CLI / API Ingestion Guide */}
-            <div className="lg:col-span-5 bg-slate-900/75 backdrop-blur-md border border-slate-800/80 rounded-xl p-5 flex flex-col justify-between gap-4 shadow-xl">
-              <div className="space-y-3">
-                <div className="flex items-center gap-2">
-                  <Code2 className="w-4 h-4 text-emerald-400" />
-                  <h3 className="text-xs font-bold uppercase tracking-wider text-slate-100">
-                    LockEvent JSON Schema &amp; REST API Ingestion
-                  </h3>
+            {/* 30% Width "How This Crash Happened" Story Timeline Sidebar */}
+            <aside className="lg:col-span-4 bg-slate-900/50 border border-slate-800/60 rounded-2xl p-6 lg:p-8 flex flex-col justify-between gap-6 shadow-xl">
+              <div className="space-y-5">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2 text-cyan-400 text-xs font-bold uppercase tracking-wider">
+                    <BookOpen className="w-4 h-4" />
+                    Step-by-Step Story
+                  </div>
+                  <h2 className="text-lg font-bold text-slate-100">
+                    How This Crash Happened
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Plain-English timeline of the events leading to the lockup:
+                  </p>
                 </div>
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Each trace event records a thread or service lock acquisition, wait edge, release,
-                  or Lamport vector-clock memory access:
-                </p>
-                <div className="p-3 rounded-lg bg-slate-950 border border-slate-800/80 font-mono text-[11px] text-slate-300 space-y-1">
-                  <div>
-                    <span className="text-cyan-400">&quot;workerId&quot;</span>: string{' '}
-                    <span className="text-slate-500">// e.g. &quot;Worker_1&quot;</span>
-                  </div>
-                  <div>
-                    <span className="text-cyan-400">&quot;resourceId&quot;</span>: string{' '}
-                    <span className="text-slate-500">// e.g. &quot;Lock_A&quot;</span>
-                  </div>
-                  <div>
-                    <span className="text-cyan-400">&quot;action&quot;</span>:{' '}
-                    <span className="text-amber-300">
-                      &quot;ACQUIRE&quot; | &quot;WAIT&quot; | &quot;RELEASE&quot; | &quot;READ&quot; | &quot;WRITE&quot;
-                    </span>
-                  </div>
-                  <div>
-                    <span className="text-cyan-400">&quot;timestamp&quot;</span>: number{' '}
-                    <span className="text-slate-500">// epoch or logical ms</span>
-                  </div>
-                  <div>
-                    <span className="text-cyan-400">&quot;vectorClock&quot;</span>:{' '}
-                    <span className="text-emerald-400">{`Record<string, number>`}</span>
-                  </div>
-                  <div>
-                    <span className="text-cyan-400">&quot;file&quot;</span>: string,{' '}
-                    <span className="text-cyan-400">&quot;line&quot;</span>: number,{' '}
-                    <span className="text-cyan-400">&quot;codeSnippet&quot;</span>: string
-                  </div>
-                </div>
+
+                {/* Numbered Story Cards */}
+                <ol className="space-y-3.5">
+                  {analysis.storySteps.map((step) => (
+                    <li
+                      key={step.stepNumber}
+                      className={`p-4 rounded-xl border space-y-1.5 ${
+                        step.isFreezeStep
+                          ? 'bg-rose-500/10 border-rose-500/40'
+                          : 'bg-slate-950/70 border-slate-800/60'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span
+                          className={`text-xs font-bold uppercase tracking-wider ${
+                            step.isFreezeStep ? 'text-rose-400' : 'text-cyan-400'
+                          }`}
+                        >
+                          Step {step.stepNumber}
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-400">
+                          {step.fileLine}
+                        </span>
+                      </div>
+                      <div className="text-sm font-bold text-slate-100">
+                        {step.title}
+                      </div>
+                      <p className="text-xs text-slate-300 leading-relaxed">
+                        {step.description}
+                      </p>
+                    </li>
+                  ))}
+                </ol>
               </div>
 
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                    CLI / API cURL Ingestion
-                  </span>
-                  <button
-                    type="button"
-                    onClick={handleCopyCurl}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-[10px] font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] cursor-pointer"
-                  >
-                    {copiedCurl ? (
-                      <>
-                        <Check className="w-3.5 h-3.5 text-emerald-400" /> Copied
-                      </>
-                    ) : (
-                      <>
-                        <Copy className="w-3.5 h-3.5" /> Copy cURL
-                      </>
+              {/* Progressive Disclosure Accordion for Advanced Math & Vector Clocks */}
+              <div className="pt-4 border-t border-slate-800/60 space-y-3">
+                <button
+                  type="button"
+                  onClick={() => setShowAdvancedMath((prev) => !prev)}
+                  className="w-full flex items-center justify-between text-xs font-semibold text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+                >
+                  <span>Show Advanced Math &amp; Vector Clocks</span>
+                  {showAdvancedMath ? (
+                    <ChevronUp className="w-4 h-4" />
+                  ) : (
+                    <ChevronDown className="w-4 h-4" />
+                  )}
+                </button>
+
+                {showAdvancedMath && (
+                  <div className="p-3.5 rounded-xl bg-slate-950 border border-slate-800/80 space-y-2.5 text-[11px] font-mono tabular-nums text-slate-300">
+                    {analysis.cycles.length > 0 && (
+                      <div>
+                        <span className="text-rose-400 font-bold block">
+                          Tarjan SCC Cycle Path:
+                        </span>
+                        <span className="break-words">
+                          {analysis.cycles[0].cycleNodes.join(' -> ')}
+                        </span>
+                      </div>
                     )}
-                  </button>
-                </div>
-                <pre className="p-3 rounded-lg bg-slate-950 border border-slate-800/80 font-mono text-[10.5px] text-slate-300 overflow-x-auto scrollbar-thin leading-relaxed">
-                  {CURL_INGEST_SNIPPET}
-                </pre>
+                    <div className="space-y-1.5">
+                      <span className="text-slate-400 block">
+                        Lamport Vector Clocks per Event:
+                      </span>
+                      {traceEvents.map((ev, i) => (
+                        <div key={ev.id || i} className="truncate text-slate-300">
+                          {ev.workerId} {ev.action} {ev.resourceId}:{' '}
+                          <span className="text-emerald-400">
+                            {JSON.stringify(ev.vectorClock)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
-            </div>
+            </aside>
           </div>
-        ) : (
-          <>
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 min-h-[480px]">
-              <div className="lg:col-span-7 flex flex-col min-w-0">
-                <LockGraphCanvas
-                  nodes={analysis.graph.nodes}
-                  edges={analysis.graph.edges}
-                  events={traceEvents}
-                  cycles={analysis.cycles}
-                  races={analysis.races}
-                  starvation={analysis.starvation}
-                  selectedNodeId={selectedNodeId}
-                  onSelectNode={setSelectedNodeId}
-                />
-              </div>
-              <div className="lg:col-span-5 flex flex-col min-w-0">
-                <CodeAndDiffPanel
-                  events={traceEvents}
-                  cycles={analysis.cycles}
-                  races={analysis.races}
-                  remediation={analysis.remediation}
-                />
-              </div>
-            </div>
+        )}
 
-            <ChaosBenchmarkBar
-              before={analysis.benchmark.before}
-              after={analysis.benchmark.after}
-              improvementFactor={analysis.benchmark.improvementFactor}
-              isRunning={isReplaying}
-              onRunReplay={handleRunChaosReplay}
-            />
-          </>
+        {/* STEP 2 VIEW: 2. Fix & Runbook (Solution) */}
+        {activeStep === 'fix' && (
+          <CodeAndDiffPanel
+            events={traceEvents}
+            cycles={analysis.cycles}
+            races={analysis.races}
+            remediation={analysis.remediation}
+          />
+        )}
+
+        {/* STEP 3 VIEW: 3. Stress-Test (500-Worker Proof) */}
+        {activeStep === 'stress' && (
+          <ChaosBenchmarkBar
+            before={analysis.benchmark.before}
+            after={analysis.benchmark.after}
+            improvementFactor={analysis.benchmark.improvementFactor}
+            isRunning={isReplaying}
+            onRunReplay={handleRunChaosReplay}
+          />
         )}
       </main>
 
