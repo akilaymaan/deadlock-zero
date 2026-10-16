@@ -7,6 +7,16 @@
  * retry-budget controls instead of pretending that a lock exists.
  */
 
+import type {
+  DeadlockCycle,
+  LockEvent,
+  RaceConflict,
+  RemediationPlan,
+  ScenarioPreset,
+} from '../shared/types';
+
+export type { RemediationPlan } from '../shared/types';
+
 type RecordLike = { readonly [key: string]: unknown };
 
 export interface CanonicalLockOrderingPatch {
@@ -22,13 +32,16 @@ export interface CanonicalLockOrderingPatch {
   readonly hasLocks: boolean;
   readonly strategy: string;
   readonly rationale: string;
+  readonly brokenCode: string;
+  readonly patchedCode: string;
+  readonly unifiedDiff: string;
   readonly patchText: string;
   readonly patch: string;
   readonly diff: string;
   readonly diffText: string;
 }
 
-export interface RemediationResult extends CanonicalLockOrderingPatch {
+export interface RemediationResult extends CanonicalLockOrderingPatch, RemediationPlan {
   /** Markdown headed exactly as a 3 a.m. operator checklist. */
   readonly runbook: string;
   readonly runbookMarkdown: string;
@@ -298,6 +311,25 @@ function controlPatch(
   };
 }
 
+function buildUnifiedDiffFromCode(
+  file: string,
+  brokenCode: string,
+  patchedCode: string,
+  fallbackDiff: string,
+): string {
+  const brokenLines = brokenCode.split(/\r?\n/).map((line) => `- ${line}`);
+  const patchedLines = patchedCode.split(/\r?\n/).map((line) => `+ ${line}`);
+  return [
+    `--- a/${file}`,
+    `+++ b/${file}`,
+    '@@ -1 +1 @@',
+    ...brokenLines,
+    ...patchedLines,
+    '',
+    fallbackDiff,
+  ].join('\n');
+}
+
 /**
  * Generate a deterministic patch proposal. No files are changed by this
  * function; callers can display or review `patchText`/`diffText` first.
@@ -316,6 +348,20 @@ export function generateCanonicalLockOrderingPatch(
   const safeControlOrder = hasLocks
     ? [...locks]
     : ['admission-gate', 'resource-acquisition', 'work', 'resource-release', 'retry-budget'];
+  const file = sourceFile(scenario);
+  const defaultBroken = [
+    `// ${file} (BROKEN: non-canonical lock / resource acquisition)`,
+    'await acquireInRequestOrder(request.resources);',
+  ].join('\n');
+  const defaultPatched = [
+    `// ${file} (PATCHED: DeadlockZero canonical lock ordering)`,
+    `const CANONICAL_LOCK_ORDER = [${locks.map(quote).join(', ')}] as const;`,
+    'await acquireAll(sortByCanonicalOrder(request.resources, CANONICAL_LOCK_ORDER));',
+  ].join('\n');
+  const brokenCode = findString(scenario, ['brokenCode']) ?? defaultBroken;
+  const patchedCode = findString(scenario, ['patchedCode']) ?? defaultPatched;
+  const unifiedDiff = buildUnifiedDiffFromCode(file, brokenCode, patchedCode, generated.patchText);
+
   return {
     scenarioId: id,
     scenarioName: name,
@@ -327,10 +373,13 @@ export function generateCanonicalLockOrderingPatch(
     hasLocks,
     strategy: generated.strategy,
     rationale: generated.rationale,
-    patchText: generated.patchText,
-    patch: generated.patchText,
-    diff: generated.patchText,
-    diffText: generated.patchText,
+    brokenCode,
+    patchedCode,
+    unifiedDiff,
+    patchText: unifiedDiff,
+    patch: unifiedDiff,
+    diff: unifiedDiff,
+    diffText: unifiedDiff,
   };
 }
 
@@ -403,3 +452,40 @@ export function remediateScenario(scenario: RemediationScenario): RemediationRes
 export const generateRemediation = remediateScenario;
 export const buildRemediation = remediateScenario;
 export const generatePatch = generateCanonicalLockOrderingPatch;
+
+/**
+ * Generate a complete RemediationPlan from a scenario preset, custom LockEvent[],
+ * or detected DeadlockCycle[] / RaceConflict[] findings.
+ */
+export function generateRemediationPlan(
+  input?: ScenarioPreset | readonly LockEvent[] | unknown,
+  cycles: readonly DeadlockCycle[] = [],
+  races: readonly RaceConflict[] = [],
+): RemediationResult {
+  if (Array.isArray(input)) {
+    const events = input as readonly LockEvent[];
+    const resources = uniqueSorted(
+      events
+        .map((e) => e.resourceId)
+        .filter((r): r is string => typeof r === 'string' && r.length > 0),
+    );
+    const firstFile = events.find((e) => typeof e.file === 'string')?.file ?? 'src/services/ledger.ts';
+    const syntheticScenario = {
+      id: 'custom-trace-remediation',
+      title: 'Custom Lock Trace Analysis',
+      category: cycles.length > 0 ? 'deadlock' : races.length > 0 ? 'data-race' : 'contention',
+      sourceFile: firstFile,
+      locks: resources,
+      resourceOrder: resources,
+      brokenCode: events.map((e) => `// ${e.file}:${e.line}\n${e.codeSnippet}`).join('\n'),
+      patchedCode: [
+        `// ${firstFile} (PATCHED: DeadlockZero canonical total lock order)`,
+        `const CANONICAL_LOCK_ORDER = [${resources.map(quote).join(', ')}] as const;`,
+        'const orderedLocks = [...requestedLocks].sort();',
+        'await acquireLocksInOrder(orderedLocks);',
+      ].join('\n'),
+    };
+    return remediateScenario(syntheticScenario);
+  }
+  return remediateScenario(input ?? {});
+}

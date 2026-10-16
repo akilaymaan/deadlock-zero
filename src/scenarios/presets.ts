@@ -9,16 +9,24 @@
  * Node.js runner.
  */
 
+import type { LockEvent, ScenarioPreset } from '../shared/types';
+
+export type { LockEvent, ScenarioPreset } from '../shared/types';
+
 /** Every preset uses the same load so scenarios can be compared fairly. */
 export const DEFAULT_WORKER_COUNT = 500 as const;
 
 /** Stable identifiers for the built-in production incident scenarios. */
 export type ScenarioId =
+  | 'payment-abba-deadlock'
+  | 'microservice-circular-rpc'
+  | 'db-pool-starvation'
+  | 'inventory-double-spend'
+  | 'cascading-retry-storm'
   | 'payment-ledger-ab-ba-lock-deadlock'
   | 'microservice-circular-rpc-lockup'
   | 'database-connection-pool-starvation'
-  | 'inventory-double-spend-vector-race'
-  | 'cascading-retry-storm';
+  | 'inventory-double-spend-vector-race';
 
 /** A descriptive alias for consumers that prefer the longer name. */
 export type IncidentScenarioId = ScenarioId;
@@ -150,10 +158,16 @@ export interface ContentionMetadata {
  * structured evidence and deterministic parameters needed by a generic
  * simulator.
  */
-export interface IncidentScenario {
+export interface IncidentScenario extends ScenarioPreset {
   readonly id: ScenarioId;
+  readonly legacyId?: ScenarioId;
   readonly title: string;
   readonly category: IncidentCategory;
+  readonly severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
+  readonly description: string;
+  readonly events: LockEvent[];
+  readonly brokenCode: string;
+  readonly patchedCode: string;
   readonly serviceArea: string;
   readonly summary: string;
   readonly rootCause: string;
@@ -164,25 +178,95 @@ export interface IncidentScenario {
   readonly tags: readonly string[];
 }
 
-/**
- * Five realistic incidents with fixed seeds and explicit healthy, failing, and
- * remediated behavior. `as const` preserves literal ids/titles and makes the
- * exported collection deeply readonly at the TypeScript boundary.
- */
-export const INCIDENT_PRESETS = [
+export const INCIDENT_PRESETS: readonly IncidentScenario[] = [
   {
-    id: 'payment-ledger-ab-ba-lock-deadlock',
+    id: 'payment-abba-deadlock',
+    legacyId: 'payment-ledger-ab-ba-lock-deadlock',
     title: 'Payment Ledger AB-BA Lock Deadlock',
     category: 'deadlock',
+    severity: 'CRITICAL',
+    description:
+      'Concurrent transfers between Account_A and Account_B acquire row locks in opposite orders in src/services/ledger.ts, causing a classic circular wait deadlock.',
     serviceArea: 'Payments / ledger write path',
     summary:
       'Transfer and reconciliation workers acquire the same account and ledger locks in opposite orders.',
     rootCause:
-      'TransferWorker holds account:{accountId} before requesting ledger:{entryId}, while ReconciliationWorker holds ledger:{entryId} before requesting account:{accountId}; a concurrent transfer and reconciliation therefore form an AB-BA wait cycle.',
+      'TransferWorker holds Account_A before requesting Account_B, while ReconciliationWorker holds Account_B before requesting Account_A; concurrent transfers therefore form an AB-BA wait cycle.',
     impact:
-      'A hot set of merchant accounts stalls payment writes, pushes p95 latency above five seconds, and causes client-visible timeouts that are retried as duplicate payment attempts.',
+      'A hot set of merchant accounts stalls payment writes, pushes p99 latency above 4.8 seconds, and causes client-visible timeouts that are retried as duplicate payment attempts.',
     remediationIntent:
-      'Enforce one global lock order (ledger entry before account balance), never perform network I/O while holding either lock, and fail a lock wait with bounded jittered retry rather than parking a worker indefinitely.',
+      'Enforce one global canonical lock order (sort lock IDs lexicographically before acquiring), never perform network I/O while holding row locks, and release locks in reverse order.',
+    events: [
+      {
+        id: 'evt-pay-1',
+        workerId: 'Worker_1',
+        resourceId: 'Account_A',
+        action: 'ACQUIRE',
+        timestamp: 1001,
+        vectorClock: { Worker_1: 1, Worker_2: 0 },
+        file: 'src/services/ledger.ts',
+        line: 41,
+        codeSnippet: 'await tx.acquireRowLock(fromAccountId); // Worker_1 locks Account_A',
+      },
+      {
+        id: 'evt-pay-2',
+        workerId: 'Worker_2',
+        resourceId: 'Account_B',
+        action: 'ACQUIRE',
+        timestamp: 1004,
+        vectorClock: { Worker_1: 0, Worker_2: 1 },
+        file: 'src/services/ledger.ts',
+        line: 42,
+        codeSnippet: 'await tx.acquireRowLock(fromAccountId); // Worker_2 locks Account_B',
+      },
+      {
+        id: 'evt-pay-3',
+        workerId: 'Worker_1',
+        resourceId: 'Account_B',
+        action: 'WAIT',
+        timestamp: 1012,
+        vectorClock: { Worker_1: 2, Worker_2: 0 },
+        file: 'src/services/ledger.ts',
+        line: 48,
+        codeSnippet: 'await tx.acquireRowLock(toAccountId);   // Worker_1 blocked on Account_B',
+      },
+      {
+        id: 'evt-pay-4',
+        workerId: 'Worker_2',
+        resourceId: 'Account_A',
+        action: 'WAIT',
+        timestamp: 1015,
+        vectorClock: { Worker_1: 0, Worker_2: 2 },
+        file: 'src/services/ledger.ts',
+        line: 49,
+        codeSnippet: 'await tx.acquireRowLock(toAccountId);   // Worker_2 blocked on Account_A',
+      },
+    ],
+    brokenCode: [
+      '// src/services/ledger.ts (BROKEN: request-dependent lock ordering)',
+      'export async function transferFunds(tx: LedgerTx, fromAccountId: string, toAccountId: string, amountCents: number) {',
+      '  await tx.acquireRowLock(fromAccountId); // Line 41: Worker_1 locks Account_A, Worker_2 locks Account_B',
+      '  await tx.acquireRowLock(toAccountId);   // Line 48: AB-BA circular wait under concurrent inverse transfers',
+      '  await tx.debit(fromAccountId, amountCents);',
+      '  await tx.credit(toAccountId, amountCents);',
+      '  await tx.releaseAll();',
+      '}',
+    ].join('\n'),
+    patchedCode: [
+      '// src/services/ledger.ts (PATCHED: DeadlockZero canonical total lock ordering)',
+      'export async function transferFunds(tx: LedgerTx, fromAccountId: string, toAccountId: string, amountCents: number) {',
+      '  const [firstLock, secondLock] = [fromAccountId, toAccountId].sort((a, b) => a.localeCompare(b));',
+      '  await tx.acquireRowLock(firstLock);  // Always acquires Account_A before Account_B',
+      '  await tx.acquireRowLock(secondLock); // Eliminates circular wait in Wait-For Graph',
+      '  try {',
+      '    await tx.debit(fromAccountId, amountCents);',
+      '    await tx.credit(toAccountId, amountCents);',
+      '  } finally {',
+      '    await tx.releaseRowLock(secondLock);',
+      '    await tx.releaseRowLock(firstLock);',
+      '  }',
+      '}',
+    ].join('\n'),
     simulation: {
       seed: 4101,
       durationSeconds: 60,
@@ -255,18 +339,107 @@ export const INCIDENT_PRESETS = [
     tags: ['payments', 'two-phase-locking', 'lock-ordering', 'idempotency'],
   },
   {
-    id: 'microservice-circular-rpc-lockup',
+    id: 'microservice-circular-rpc',
+    legacyId: 'microservice-circular-rpc-lockup',
     title: 'Microservice Circular RPC Lockup',
     category: 'distributed-deadlock',
+    severity: 'CRITICAL',
+    description:
+      'OrderService -> InventoryService -> BillingService -> OrderService hold distributed mutexes across synchronous RPC calls in src/rpc/orderMesh.ts.',
     serviceArea: 'Checkout / pricing / inventory RPC mesh',
     summary:
       'Synchronous service-to-service calls retain local mutexes while making a circular checkout, pricing, and inventory RPC chain.',
     rootCause:
-      'Checkout holds its order mutex while calling Pricing, Pricing holds a promotion mutex while calling Inventory, and Inventory calls Checkout for reservation confirmation; the cycle is amplified by synchronous RPC deadlines and shared worker pools.',
+      'OrderService holds OrderMutex while calling InventoryService, InventoryService holds StockMutex while calling BillingService, and BillingService holds InvoiceMutex while calling OrderService for state confirmation.',
     impact:
-      'A small fraction of promotion-heavy carts consumes all three services’ RPC and worker capacity, returning 503s to checkout and causing a broad but uneven availability drop across regions.',
+      'A small fraction of promotion-heavy carts consumes all three services’ RPC and worker capacity, returning 503s to checkout and causing a broad availability drop.',
     remediationIntent:
-      'Break the synchronous cycle with an asynchronous reservation workflow, release local mutexes before RPC, propagate a single deadline, and apply bounded bulkheads per downstream dependency.',
+      'Break the synchronous cycle with an asynchronous reservation workflow, release local mutexes before RPC boundaries, and enforce canonical lock hierarchy.',
+    events: [
+      {
+        id: 'evt-rpc-1',
+        workerId: 'OrderService',
+        resourceId: 'OrderMutex',
+        action: 'ACQUIRE',
+        timestamp: 2001,
+        vectorClock: { OrderService: 1, InventoryService: 0, BillingService: 0 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 28,
+        codeSnippet: 'await distLock.acquire("OrderMutex");',
+      },
+      {
+        id: 'evt-rpc-2',
+        workerId: 'InventoryService',
+        resourceId: 'StockMutex',
+        action: 'ACQUIRE',
+        timestamp: 2005,
+        vectorClock: { OrderService: 0, InventoryService: 1, BillingService: 0 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 54,
+        codeSnippet: 'await distLock.acquire("StockMutex");',
+      },
+      {
+        id: 'evt-rpc-3',
+        workerId: 'BillingService',
+        resourceId: 'InvoiceMutex',
+        action: 'ACQUIRE',
+        timestamp: 2009,
+        vectorClock: { OrderService: 0, InventoryService: 0, BillingService: 1 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 81,
+        codeSnippet: 'await distLock.acquire("InvoiceMutex");',
+      },
+      {
+        id: 'evt-rpc-4',
+        workerId: 'OrderService',
+        resourceId: 'StockMutex',
+        action: 'WAIT',
+        timestamp: 2018,
+        vectorClock: { OrderService: 2, InventoryService: 0, BillingService: 0 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 34,
+        codeSnippet: 'await rpc.inventory.reserveWithLock("StockMutex"); // blocked on InventoryService',
+      },
+      {
+        id: 'evt-rpc-5',
+        workerId: 'InventoryService',
+        resourceId: 'InvoiceMutex',
+        action: 'WAIT',
+        timestamp: 2022,
+        vectorClock: { OrderService: 0, InventoryService: 2, BillingService: 0 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 61,
+        codeSnippet: 'await rpc.billing.holdMarginWithLock("InvoiceMutex"); // blocked on BillingService',
+      },
+      {
+        id: 'evt-rpc-6',
+        workerId: 'BillingService',
+        resourceId: 'OrderMutex',
+        action: 'WAIT',
+        timestamp: 2027,
+        vectorClock: { OrderService: 0, InventoryService: 0, BillingService: 2 },
+        file: 'src/rpc/orderMesh.ts',
+        line: 88,
+        codeSnippet: 'await rpc.orders.confirmOrderWithLock("OrderMutex"); // blocked on OrderService',
+      },
+    ],
+    brokenCode: [
+      '// src/rpc/orderMesh.ts (BROKEN: holding distributed mutexes across synchronous circular RPC)',
+      'export async function checkoutOrderMesh(orderId: string, skuId: string) {',
+      '  await distLock.acquire("OrderMutex");                // Line 28: held across downstream RPCs',
+      '  await rpc.inventory.reserveWithLock("StockMutex");   // Line 34: waits on Inventory -> Billing -> Order',
+      '  await distLock.release("OrderMutex");',
+      '}',
+    ].join('\n'),
+    patchedCode: [
+      '// src/rpc/orderMesh.ts (PATCHED: release local mutex before RPC & enforce DAG lock hierarchy)',
+      'export async function checkoutOrderMesh(orderId: string, skuId: string) {',
+      '  const reservationToken = await distLock.withScopedLock("OrderMutex", async () => {',
+      '    return prepareOrderIntent(orderId, skuId);',
+      '  }); // OrderMutex released before crossing RPC boundary',
+      '  await rpc.inventory.reserveAsync(reservationToken, { timeoutMs: 250 });',
+      '}',
+    ].join('\n'),
     simulation: {
       seed: 4102,
       durationSeconds: 60,
@@ -347,18 +520,111 @@ export const INCIDENT_PRESETS = [
     tags: ['microservices', 'rpc', 'circular-wait', 'bulkhead'],
   },
   {
-    id: 'database-connection-pool-starvation',
+    id: 'db-pool-starvation',
+    legacyId: 'database-connection-pool-starvation',
     title: 'Database Connection Pool Starvation',
     category: 'resource-starvation',
+    severity: 'HIGH',
+    description:
+      'Workers acquire a DB transaction lock in src/db/poolManager.ts before awaiting an un-timed-out external webhook, starving >80% of the worker pool.',
     serviceArea: 'Order API / primary database',
     summary:
-      'HTTP workers retain scarce database connections while awaiting a slow audit service, exhausting the primary pool.',
+      'HTTP workers retain scarce database connections while awaiting a slow external webhook, exhausting the primary pool.',
     rootCause:
-      'The request handler checks out a primary connection before starting an independent audit RPC and keeps it checked out until the RPC returns; a p99 audit latency spike pins all 80 connections while hundreds of workers queue.',
+      'The request handler acquires pg_tx_pool before awaiting an un-timed-out external webhook and keeps it checked out until the webhook returns; >80% of workers block indefinitely in WAIT.',
     impact:
-      'New order requests queue behind the exhausted pool, hit the 12-second request deadline, and are dropped even though the database itself has CPU and I/O headroom.',
+      'New order requests queue behind the exhausted pool, hit the request deadline, and are dropped even though the database itself has CPU and I/O headroom.',
     remediationIntent:
-      'Keep the database critical section narrow, release connections before external calls, isolate audit writes in an independent bounded queue, and expose pool wait time as a saturation signal.',
+      'Keep the database critical section narrow, release connections before external webhook calls, and enforce a strict connection acquisition timeout.',
+    events: [
+      {
+        id: 'evt-pool-1',
+        workerId: 'Worker_1',
+        resourceId: 'pg_tx_pool',
+        action: 'ACQUIRE',
+        timestamp: 3001,
+        vectorClock: { Worker_1: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 31,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // held during external webhook',
+      },
+      {
+        id: 'evt-pool-2',
+        workerId: 'Worker_2',
+        resourceId: 'pg_tx_pool',
+        action: 'WAIT',
+        timestamp: 3010,
+        vectorClock: { Worker_2: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 37,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // Worker_2 starved waiting on pool',
+      },
+      {
+        id: 'evt-pool-3',
+        workerId: 'Worker_3',
+        resourceId: 'pg_tx_pool',
+        action: 'WAIT',
+        timestamp: 3012,
+        vectorClock: { Worker_3: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 37,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // Worker_3 starved waiting on pool',
+      },
+      {
+        id: 'evt-pool-4',
+        workerId: 'Worker_4',
+        resourceId: 'pg_tx_pool',
+        action: 'WAIT',
+        timestamp: 3015,
+        vectorClock: { Worker_4: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 37,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // Worker_4 starved waiting on pool',
+      },
+      {
+        id: 'evt-pool-5',
+        workerId: 'Worker_5',
+        resourceId: 'pg_tx_pool',
+        action: 'WAIT',
+        timestamp: 3019,
+        vectorClock: { Worker_5: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 37,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // Worker_5 starved waiting on pool',
+      },
+      {
+        id: 'evt-pool-6',
+        workerId: 'Worker_6',
+        resourceId: 'pg_tx_pool',
+        action: 'WAIT',
+        timestamp: 3024,
+        vectorClock: { Worker_6: 1 },
+        file: 'src/db/poolManager.ts',
+        line: 37,
+        codeSnippet: 'const conn = await pool.acquire("pg_tx_pool"); // Worker_6 starved waiting on pool',
+      },
+    ],
+    brokenCode: [
+      '// src/db/poolManager.ts (BROKEN: DB connection held across un-timed-out external webhook)',
+      'export async function processOrderWithWebhook(order: OrderPayload) {',
+      '  const conn = await pool.acquire("pg_tx_pool"); // Line 31: connection checked out early',
+      '  await conn.query("INSERT INTO orders VALUES ($1)", [order.id]);',
+      '  await fetch(order.webhookUrl);                 // Line 37: blocks pool when webhook stalls',
+      '  await conn.release();',
+      '}',
+    ].join('\n'),
+    patchedCode: [
+      '// src/db/poolManager.ts (PATCHED: release DB connection before external I/O + bounded timeout)',
+      'export async function processOrderWithWebhook(order: OrderPayload) {',
+      '  const conn = await pool.acquire("pg_tx_pool", { acquireTimeoutMs: 150 });',
+      '  try {',
+      '    await conn.query("INSERT INTO orders VALUES ($1)", [order.id]);',
+      '  } finally {',
+      '    await conn.release(); // Connection returned to pool before external network call',
+      '  }',
+      '  await fetchWithTimeout(order.webhookUrl, { timeoutMs: 1500 });',
+      '}',
+    ].join('\n'),
     simulation: {
       seed: 4103,
       durationSeconds: 60,
@@ -431,18 +697,86 @@ export const INCIDENT_PRESETS = [
     tags: ['database', 'connection-pool', 'starvation', 'backpressure'],
   },
   {
-    id: 'inventory-double-spend-vector-race',
-    title: 'Inventory Double-Spend Vector Race',
+    id: 'inventory-double-spend',
+    legacyId: 'inventory-double-spend-vector-race',
+    title: 'Inventory Flash-Sale Vector Race',
     category: 'data-race',
+    severity: 'HIGH',
+    description:
+      'Concurrent READ then WRITE on sku_99_stock in src/checkout/stockEngine.ts with concurrent vector clocks {w1: 2, w2: 1} vs {w1: 1, w2: 2}, causing a flash-sale double-spend race.',
     serviceArea: 'Inventory reservation / fulfillment',
     summary:
-      'Reservation and cancellation workers concurrently update the same SKU quantity without a common synchronization edge.',
+      'Reservation workers concurrently read and overwrite sku_99_stock without a common lock or happens-before edge.',
     rootCause:
-      'The reservation path reads inventory:available and later writes the decremented value, while cancellation writes a restoration from a concurrent vector-clock branch; neither path uses an atomic conditional update or shared lock, so both can commit from the same stale quantity.',
+      'Worker w1 and Worker w2 both read sku_99_stock and write decremented stock counts with concurrent Lamport vector clocks ({w1: 2, w2: 1} || {w1: 1, w2: 2}); neither clock dominates the other, causing lost updates.',
     impact:
-      'Hot SKUs briefly report more units reserved than exist, producing oversells, fulfillment reversals, and manual compensating refunds while request availability remains mostly healthy.',
+      'Hot flash-sale SKUs report more units reserved than exist in physical inventory, producing oversells and fulfillment reversals.',
     remediationIntent:
-      'Make the quantity transition a single compare-and-swap/serializable update, include the reservation version in the write predicate, and reject stale vector-clock branches for the same SKU.',
+      'Serialize stock decrements with a per-SKU mutex or atomic compare-and-swap (CAS) predicate verifying the expected version clock.',
+    events: [
+      {
+        id: 'evt-race-1',
+        workerId: 'w1',
+        resourceId: 'sku_99_stock',
+        action: 'READ',
+        timestamp: 4001,
+        vectorClock: { w1: 1, w2: 1 },
+        file: 'src/checkout/stockEngine.ts',
+        line: 24,
+        codeSnippet: 'const current = await stockStore.read("sku_99_stock"); // w1 reads stock=1',
+      },
+      {
+        id: 'evt-race-2',
+        workerId: 'w2',
+        resourceId: 'sku_99_stock',
+        action: 'READ',
+        timestamp: 4002,
+        vectorClock: { w1: 1, w2: 1 },
+        file: 'src/checkout/stockEngine.ts',
+        line: 24,
+        codeSnippet: 'const current = await stockStore.read("sku_99_stock"); // w2 reads stock=1',
+      },
+      {
+        id: 'evt-race-3',
+        workerId: 'w1',
+        resourceId: 'sku_99_stock',
+        action: 'WRITE',
+        timestamp: 4008,
+        vectorClock: { w1: 2, w2: 1 },
+        file: 'src/checkout/stockEngine.ts',
+        line: 31,
+        codeSnippet: 'await stockStore.write("sku_99_stock", current - 1); // w1 writes with clock {w1:2, w2:1}',
+      },
+      {
+        id: 'evt-race-4',
+        workerId: 'w2',
+        resourceId: 'sku_99_stock',
+        action: 'WRITE',
+        timestamp: 4009,
+        vectorClock: { w1: 1, w2: 2 },
+        file: 'src/checkout/stockEngine.ts',
+        line: 31,
+        codeSnippet: 'await stockStore.write("sku_99_stock", current - 1); // w2 writes with clock {w1:1, w2:2}',
+      },
+    ],
+    brokenCode: [
+      '// src/checkout/stockEngine.ts (BROKEN: unsynchronized read-modify-write on sku_99_stock)',
+      'export async function reserveFlashSaleItem(skuId: string, qty: number) {',
+      '  const current = await stockStore.read(skuId);          // Line 24: concurrent unsynchronized READ',
+      '  if (current < qty) throw new Error("Out of stock");',
+      '  await stockStore.write(skuId, current - qty);          // Line 31: concurrent WRITE ({w1:2,w2:1} || {w1:1,w2:2})',
+      '}',
+    ].join('\n'),
+    patchedCode: [
+      '// src/checkout/stockEngine.ts (PATCHED: per-SKU mutex + atomic compare-and-swap version check)',
+      'export async function reserveFlashSaleItem(skuId: string, qty: number) {',
+      '  return skuLockManager.withLock(`lock:${skuId}`, async () => {',
+      '    const { value, version } = await stockStore.readVersioned(skuId);',
+      '    if (value < qty) throw new Error("Out of stock");',
+      '    await stockStore.compareAndSwap(skuId, value - qty, version); // Enforces total causal order',
+      '  });',
+      '}',
+    ].join('\n'),
     simulation: {
       seed: 4104,
       durationSeconds: 60,
@@ -516,17 +850,88 @@ export const INCIDENT_PRESETS = [
   },
   {
     id: 'cascading-retry-storm',
-    title: 'Cascading Retry Storm',
+    legacyId: 'cascading-retry-storm',
+    title: 'Distributed Lock Retry Storm',
     category: 'retry-storm',
+    severity: 'HIGH',
+    description:
+      'Synchronized thundering-herd retries without exponential backoff or jitter in src/queue/retryWorker.ts contend on shard locks and retry budgets.',
     serviceArea: 'API gateway / catalog dependency mesh',
     summary:
-      'Retries without a shared budget or jitter multiply load after a catalog dependency begins returning transient 503s.',
+      'Retries without a shared budget or jitter multiply load after a dependency begins returning transient 503s.',
     rootCause:
-      'The gateway, catalog facade, and recommendation client each retry the same request independently; exponential backoff resets at every hop, so one failed catalog call fans out into several synchronized attempts and consumes the downstream quota.',
+      'RetryWorker_1 and RetryWorker_2 re-acquire shard_lock and retry_quota_lock in conflicting orders during synchronized zero-jitter retries, triggering both lock cycles and queue saturation.',
     impact:
-      'A transient catalog brownout becomes a fleet-wide saturation event: healthy requests are evicted from queues, p95 latency reaches seconds, and downstream recovery is delayed by self-generated traffic.',
+      'A transient brownout becomes a fleet-wide saturation event: healthy requests are evicted from queues and p99 latency spikes above 4.9 seconds.',
     remediationIntent:
-      'Propagate one deadline and retry budget per request, retry only idempotent operations with full jitter, honor Retry-After, and use a per-dependency circuit breaker plus load-shedding queue.',
+      'Propagate a single retry budget per request, acquire shard and quota locks in canonical order, and apply exponential backoff with full jitter.',
+    events: [
+      {
+        id: 'evt-retry-1',
+        workerId: 'RetryWorker_1',
+        resourceId: 'shard_lock_0',
+        action: 'ACQUIRE',
+        timestamp: 5001,
+        vectorClock: { RetryWorker_1: 1, RetryWorker_2: 0 },
+        file: 'src/queue/retryWorker.ts',
+        line: 22,
+        codeSnippet: 'await lockManager.acquire("shard_lock_0"); // RetryWorker_1 holds shard_lock_0',
+      },
+      {
+        id: 'evt-retry-2',
+        workerId: 'RetryWorker_2',
+        resourceId: 'retry_quota_lock',
+        action: 'ACQUIRE',
+        timestamp: 5003,
+        vectorClock: { RetryWorker_1: 0, RetryWorker_2: 1 },
+        file: 'src/queue/retryWorker.ts',
+        line: 29,
+        codeSnippet: 'await lockManager.acquire("retry_quota_lock"); // RetryWorker_2 holds retry_quota_lock',
+      },
+      {
+        id: 'evt-retry-3',
+        workerId: 'RetryWorker_1',
+        resourceId: 'retry_quota_lock',
+        action: 'WAIT',
+        timestamp: 5008,
+        vectorClock: { RetryWorker_1: 2, RetryWorker_2: 0 },
+        file: 'src/queue/retryWorker.ts',
+        line: 36,
+        codeSnippet: 'await lockManager.acquire("retry_quota_lock"); // blocked on RetryWorker_2',
+      },
+      {
+        id: 'evt-retry-4',
+        workerId: 'RetryWorker_2',
+        resourceId: 'shard_lock_0',
+        action: 'WAIT',
+        timestamp: 5010,
+        vectorClock: { RetryWorker_1: 0, RetryWorker_2: 2 },
+        file: 'src/queue/retryWorker.ts',
+        line: 43,
+        codeSnippet: 'await lockManager.acquire("shard_lock_0"); // blocked on RetryWorker_1',
+      },
+    ],
+    brokenCode: [
+      '// src/queue/retryWorker.ts (BROKEN: zero-jitter retry loop with inverted lock acquisition)',
+      'export async function executeWithRetry(job: QueueJob) {',
+      '  while (true) {',
+      '    await lockManager.acquire(job.primaryLock);   // Line 22: unsorted lock acquisition',
+      '    await lockManager.acquire(job.secondaryLock); // Line 36: deadlocks under thundering-herd retry',
+      '    if (await tryDispatch(job)) break;',
+      '  }',
+      '}',
+    ].join('\n'),
+    patchedCode: [
+      '// src/queue/retryWorker.ts (PATCHED: canonical lock order + bounded retry budget with full jitter)',
+      'export async function executeWithRetry(job: QueueJob) {',
+      '  const orderedLocks = [job.primaryLock, job.secondaryLock].sort();',
+      '  for (let attempt = 0; attempt < 3; attempt++) {',
+      '    if (await lockManager.withCanonicalLocks(orderedLocks, () => tryDispatch(job))) return;',
+      '    const jitterMs = Math.random() * Math.min(1000, 50 * Math.pow(2, attempt));',
+      '    await sleep(jitterMs); // Release all locks before sleeping on backoff',
+      '  }',
+      '}',
+    ].join('\n'),
     simulation: {
       seed: 4105,
       durationSeconds: 60,
@@ -599,22 +1004,30 @@ export const INCIDENT_PRESETS = [
     },
     tags: ['retries', 'backpressure', 'circuit-breaker', 'load-shedding'],
   },
-] as const satisfies readonly IncidentScenario[];
+] satisfies readonly IncidentScenario[];
 
 /** Alias retained for callers that use the shorter scenario-oriented name. */
 export const SCENARIO_PRESETS = INCIDENT_PRESETS;
+export const PRESETS = INCIDENT_PRESETS;
 
 /** Lower-camel-case alias for JavaScript consumers. */
 export const scenarioPresets = INCIDENT_PRESETS;
 
+const LEGACY_ID_ALIASES: Readonly<Record<string, string>> = {
+  'payment-ledger-ab-ba-lock-deadlock': 'payment-abba-deadlock',
+  'microservice-circular-rpc-lockup': 'microservice-circular-rpc',
+  'database-connection-pool-starvation': 'db-pool-starvation',
+  'inventory-double-spend-vector-race': 'inventory-double-spend',
+};
+
 /**
- * Return a preset by stable id.
- *
- * The first overload gives known ids a non-optional result, while the string
- * overload keeps runtime callers safe when an id comes from a URL or config.
+ * Return a preset by stable id (supports both primary and legacy scenario IDs).
  */
 export function getScenarioPreset(id: ScenarioId): IncidentScenario;
 export function getScenarioPreset(id: string): IncidentScenario | undefined;
 export function getScenarioPreset(id: string): IncidentScenario | undefined {
-  return INCIDENT_PRESETS.find((scenario) => scenario.id === id);
+  const normalizedId = LEGACY_ID_ALIASES[id] ?? id;
+  return INCIDENT_PRESETS.find(
+    (scenario) => scenario.id === normalizedId || scenario.legacyId === id,
+  );
 }
