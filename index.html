@@ -1,12 +1,28 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#07111f" />
-    <title>DeadlockZero</title>
+    <meta name="theme-color" content="#090D16" />
+    <title>DeadlockZero — Lock-Ordering &amp; Outage Forensics Workbench</title>
+    <style>
+      @font-face {
+        font-family: 'Inter';
+        font-style: normal;
+        font-weight: 400 700;
+        font-display: swap;
+        src: local('Inter'), local('Inter-Regular'), local('Segoe UI'), local('Roboto'), local('Helvetica Neue'), local('Arial');
+      }
+      @font-face {
+        font-family: 'JetBrains Mono';
+        font-style: normal;
+        font-weight: 400 700;
+        font-display: swap;
+        src: local('JetBrains Mono'), local('JetBrainsMono-Regular'), local('Cascadia Mono'), local('Consolas'), local('Menlo'), local('Monaco');
+      }
+    </style>
   </head>
-  <body>
+  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-cyan-500/30 selection:text-cyan-200">
     <div id="root"></div>
     <script type="module" src="/src/client/main.tsx"></script>
   </body>

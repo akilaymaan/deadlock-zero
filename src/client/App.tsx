@@ -3,6 +3,7 @@ import {
   Activity,
   GitBranch,
   Layers,
+  Loader2,
   Play,
   RotateCcw,
   ShieldAlert,
@@ -67,6 +68,7 @@ export const App: React.FC = () => {
   }, [activeEvents, activePreset, customEvents, replayCount]);
 
   const handleRunChaosReplay = async () => {
+    if (isReplaying) return;
     setIsReplaying(true);
     try {
       await fetch('/api/benchmark', {
@@ -87,29 +89,29 @@ export const App: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col overflow-x-hidden">
       {/* Top Studio Navigation Bar */}
-      <header className="border-b border-slate-800/90 bg-slate-900/95 backdrop-blur-md px-6 py-3.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
-        <div className="flex items-center gap-3">
-          <div className="p-2 rounded-xl bg-rose-500/15 border border-rose-500/40 shadow-[0_0_15px_-3px_rgba(244,63,94,0.4)]">
-            <ShieldAlert className="w-5 h-5 text-rose-400" />
+      <header className="border-b border-slate-800/80 bg-slate-900/75 backdrop-blur-md px-4 lg:px-6 py-3 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="w-9 h-9 rounded-xl bg-rose-500/10 border border-rose-500/40 flex items-center justify-center shrink-0">
+            <ShieldAlert className="w-4 h-4 text-rose-400" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-base font-bold tracking-tight text-slate-100">
+              <h1 className="text-sm sm:text-base font-bold tracking-tight text-slate-100 truncate">
                 DeadlockZero // Concurrency &amp; Outage Forensics Workbench
               </h1>
-              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold uppercase bg-emerald-500/15 text-emerald-300 border border-emerald-500/40 flex items-center gap-1">
-                <Sparkles className="w-3 h-3" /> 100% Offline Deterministic
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold uppercase bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 flex items-center gap-1 shrink-0">
+                <Sparkles className="w-3.5 h-3.5" /> 100% Offline Deterministic
               </span>
             </div>
-            <p className="text-xs text-slate-400">
+            <p className="text-xs text-slate-400 truncate">
               Tarjan&apos;s SCC Cycle Detector • Lamport Vector-Clock Verifier • 500-Worker Chaos Simulator
             </p>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
           <label htmlFor="scenario-select" className="sr-only">
             Select Outage Scenario
           </label>
@@ -121,7 +123,7 @@ export const App: React.FC = () => {
               setCustomEvents(null);
               setSelectedNodeId(null);
             }}
-            className="px-3 py-1.5 rounded-lg bg-slate-950 border border-slate-700 hover:border-slate-600 text-xs font-medium text-slate-100 focus:outline-none focus:border-cyan-400 cursor-pointer"
+            className="h-9 px-3 rounded-lg bg-slate-950 border border-slate-800/80 hover:border-slate-700 text-xs font-medium text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 transition-colors cursor-pointer"
           >
             {INCIDENT_PRESETS.map((preset) => (
               <option key={preset.id} value={preset.id}>
@@ -133,10 +135,13 @@ export const App: React.FC = () => {
           {customEvents && (
             <button
               type="button"
-              onClick={() => setCustomEvents(null)}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-amber-500/15 border border-amber-500/40 text-amber-300 text-xs font-medium hover:bg-amber-500/25 cursor-pointer"
+              onClick={() => {
+                setCustomEvents(null);
+                setSelectedNodeId(null);
+              }}
+              className="h-9 flex items-center gap-1.5 px-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-amber-400 text-xs font-semibold hover:bg-amber-500/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
             >
-              <RotateCcw className="w-3.5 h-3.5" />
+              <RotateCcw className="w-4 h-4" />
               Reset Custom Trace
             </button>
           )}
@@ -144,40 +149,50 @@ export const App: React.FC = () => {
           <button
             type="button"
             onClick={() => setIsModalOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs font-medium text-slate-200 transition-colors cursor-pointer"
+            className="h-9 flex items-center gap-1.5 px-3 rounded-lg bg-slate-800/90 hover:bg-slate-700 border border-slate-700/80 text-xs font-semibold text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] transition-all cursor-pointer"
           >
-            <Terminal className="w-3.5 h-3.5 text-cyan-400" />
+            <Terminal className="w-4 h-4 text-cyan-400" />
             Paste Custom Trace
           </button>
 
           <button
             type="button"
             onClick={handleRunChaosReplay}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold shadow-md transition-colors cursor-pointer"
+            disabled={isReplaying}
+            className="h-9 flex items-center gap-1.5 px-3.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98] disabled:opacity-50 disabled:pointer-events-none transition-all cursor-pointer"
           >
-            <Play className="w-3.5 h-3.5" />
-            Run 500-Worker Chaos Replay
+            {isReplaying ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Replaying...
+              </>
+            ) : (
+              <>
+                <Play className="w-4 h-4" />
+                Run 500-Worker Chaos Replay
+              </>
+            )}
           </button>
         </div>
       </header>
 
       {/* Active Incident Summary Strip */}
-      <div className="bg-slate-950/90 border-b border-slate-900 px-6 py-2.5">
+      <div className="bg-slate-900/50 border-b border-slate-800/80 px-4 lg:px-6 py-2.5">
         <div className="max-w-[1600px] w-full mx-auto flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex flex-wrap items-center gap-2.5 min-w-0">
             <span
-              className={`px-2 py-0.5 rounded font-mono font-bold text-[10px] uppercase ${
+              className={`px-2 py-0.5 rounded font-mono font-bold text-[10px] uppercase shrink-0 ${
                 customEvents
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                  : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+                  ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30'
+                  : 'bg-rose-500/10 text-rose-400 border border-rose-500/40'
               }`}
             >
               {customEvents ? 'CUSTOM TRACE' : activePreset.severity}
             </span>
-            <span className="font-semibold text-slate-200">
+            <span className="font-semibold text-slate-100 truncate">
               {customEvents ? 'Custom LockEvent[] Forensic Session' : activePreset.title}
             </span>
-            <span className="text-slate-600 hidden sm:inline">•</span>
+            <span className="text-slate-600 hidden md:inline">•</span>
             <span className="text-slate-400 truncate max-w-2xl">
               {customEvents
                 ? `Evaluating ${customEvents.length} custom lock/vector-clock trace events.`
@@ -185,27 +200,27 @@ export const App: React.FC = () => {
             </span>
           </div>
 
-          <div className="flex items-center gap-4 text-[11px] font-mono text-slate-400">
-            <span className="flex items-center gap-1">
-              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+          <div className="flex items-center gap-4 text-[11px] font-mono tabular-nums text-slate-400 shrink-0">
+            <span className="flex items-center gap-1.5">
+              <Layers className="w-4 h-4 text-cyan-400" />
               Service: <strong className="text-slate-200">{activePreset.serviceArea}</strong>
             </span>
-            <span className="flex items-center gap-1">
-              <GitBranch className="w-3.5 h-3.5 text-emerald-400" />
+            <span className="flex items-center gap-1.5">
+              <GitBranch className="w-4 h-4 text-emerald-400" />
               Events: <strong className="text-slate-200">{activeEvents.length}</strong>
             </span>
-            <span className="flex items-center gap-1">
-              <Activity className="w-3.5 h-3.5 text-amber-400" />
+            <span className="flex items-center gap-1.5">
+              <Activity className="w-4 h-4 text-amber-400" />
               Workers: <strong className="text-slate-200">500</strong>
             </span>
           </div>
         </div>
       </div>
 
-      {/* Main Studio Grid */}
-      <main className="flex-1 p-6 flex flex-col gap-5 max-w-[1600px] w-full mx-auto">
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 flex-1 min-h-[470px]">
-          <div className="lg:col-span-7 flex flex-col">
+      {/* Main Studio Workspace Grid (consistent p-4/p-5 and gap-4) */}
+      <main className="flex-1 p-4 lg:p-5 flex flex-col gap-4 max-w-[1600px] w-full mx-auto">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 flex-1 min-h-[480px]">
+          <div className="lg:col-span-7 flex flex-col min-w-0">
             <LockGraphCanvas
               nodes={analysis.graph.nodes}
               edges={analysis.graph.edges}
@@ -217,7 +232,7 @@ export const App: React.FC = () => {
               onSelectNode={setSelectedNodeId}
             />
           </div>
-          <div className="lg:col-span-5 flex flex-col">
+          <div className="lg:col-span-5 flex flex-col min-w-0">
             <CodeAndDiffPanel
               events={activeEvents}
               cycles={analysis.cycles}
@@ -240,7 +255,10 @@ export const App: React.FC = () => {
         isOpen={isModalOpen}
         initialEvents={activeEvents}
         onClose={() => setIsModalOpen(false)}
-        onAnalyzeCustomTrace={(events) => setCustomEvents(events)}
+        onAnalyzeCustomTrace={(events) => {
+          setCustomEvents(events);
+          setSelectedNodeId(null);
+        }}
       />
     </div>
   );
