@@ -1,3 +1,4 @@
+import cors from 'cors';
 import express, { type Express, type NextFunction, type Request, type Response } from 'express';
 import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
@@ -8,24 +9,31 @@ import {
   type DeadlockFinding,
 } from '../engine/deadlockDetector';
 import {
+  buildWaitForGraph,
   WaitForGraph,
   type ExecutionNode,
+  type LockEvent,
   type ResourceNode,
   type SourceCodeReference,
   type WaitForGraphSnapshot,
 } from '../engine/graph';
 import {
   analyzeRaceTrace,
+  detectRaces,
+  detectStarvation,
   type RaceAnalysis,
   type RaceAnalysisInput,
 } from '../engine/raceDetector';
 import {
+  generateRemediationPlan,
   remediateScenario,
   type RemediationResult,
 } from '../engine/remediator';
 import {
   DEFAULT_WORKER_COUNT,
+  runChaosBenchmark,
   simulateScenario,
+  type SimulationMetrics,
   type SimulationResult,
 } from '../engine/simulator';
 import {
@@ -79,28 +87,33 @@ interface AnalysisSource {
 interface AnalysisResponse {
   readonly source: AnalysisSource;
   readonly scenario: unknown;
+  readonly events: readonly LockEvent[];
   readonly graph: WaitForGraphSnapshot & {
-    readonly nodes: readonly (ExecutionNode | ResourceNode)[];
-    readonly edges: WaitForGraphSnapshot['waitForEdges'];
+    readonly nodes: readonly unknown[];
+    readonly edges: readonly unknown[];
   };
-  readonly nodes: readonly (ExecutionNode | ResourceNode)[];
-  readonly edges: WaitForGraphSnapshot['waitForEdges'];
+  readonly nodes: readonly unknown[];
+  readonly edges: readonly unknown[];
   readonly deadlocks: readonly DeadlockFinding[];
   readonly detectedCycles: readonly (readonly string[])[];
-  readonly cycles: readonly (readonly string[])[];
+  readonly cycles: readonly DeadlockFinding[];
   readonly raceAnalysis: RaceAnalysis;
   readonly races: RaceAnalysis['races'];
   readonly dataRaces: RaceAnalysis['dataRaces'];
   readonly poolStarvation: RaceAnalysis['poolStarvation'];
+  readonly starvation: RaceAnalysis['poolStarvation'];
   readonly offendingCodeLines: readonly SourceCodeReference[];
   readonly offendingLines: readonly SourceCodeReference[];
   readonly patch: string;
   readonly patchDiff: string;
   readonly diff: string;
+  readonly unifiedDiff: string;
   readonly remediation: RemediationResult;
+  readonly remediationPlan: RemediationResult;
   readonly incidentChecklist: string;
   readonly checklist: string;
   readonly runbook: string;
+  readonly runbookMarkdown: string;
 }
 
 interface BenchmarkComparison {
@@ -108,8 +121,9 @@ interface BenchmarkComparison {
   readonly scenarioName: string;
   readonly workerCount: number;
   readonly workers: number;
-  readonly before: SimulationResult;
-  readonly after: SimulationResult;
+  readonly before: SimulationResult & SimulationMetrics;
+  readonly after: SimulationResult & SimulationMetrics;
+  readonly improvementFactor: number;
   readonly comparison: {
     readonly throughputRps: MetricComparison;
     readonly latencyMs: {
@@ -885,72 +899,165 @@ function tracePayloadFromBody(body: unknown): unknown {
   return firstDefined(body, ['trace', 'logTrace', 'lockEventTrace', 'events', 'lockEvents']) ?? body;
 }
 
+function isLockEventLike(item: unknown): item is LockEvent {
+  if (!isRecord(item)) return false;
+  return (
+    typeof item.workerId === 'string' &&
+    typeof item.resourceId === 'string' &&
+    typeof item.action === 'string'
+  );
+}
+
+function extractCustomLockEvents(body: unknown): LockEvent[] | undefined {
+  if (Array.isArray(body) && body.length > 0 && body.every(isLockEventLike)) {
+    return body;
+  }
+  if (!isRecord(body)) return undefined;
+  const candidate = firstDefined(body, ['customEvents', 'events', 'trace']);
+  if (Array.isArray(candidate) && candidate.length > 0 && candidate.every(isLockEventLike)) {
+    return candidate as LockEvent[];
+  }
+  return undefined;
+}
+
 function analyzeBody(body: unknown, request: Request): AnalysisResponse {
   const presetId = presetIdFromRequest(body, request);
+  const customLockEvents = extractCustomLockEvents(body);
+
+  if (presetId !== undefined || customLockEvents !== undefined) {
+    let preset: IncidentScenario | undefined;
+    if (presetId !== undefined) {
+      preset = getScenarioPreset(presetId);
+      if (preset === undefined) {
+        throw new HttpError(404, `Unknown scenario preset "${presetId}"`, 'SCENARIO_NOT_FOUND');
+      }
+    }
+    const events: LockEvent[] = customLockEvents ?? (preset ? preset.events : []);
+    const wfg = buildWaitForGraph(events);
+    const deadlocks = detectDeadlocks(wfg);
+    const races = detectRaces(events);
+    const poolStarvation = preset && preset.category === 'resource-starvation' && detectStarvation(events).length === 0
+      ? analyzeRaceTrace(raceInputForPreset(preset)).poolStarvation
+      : detectStarvation(events);
+    const raceAnalysis: RaceAnalysis = {
+      races,
+      dataRaces: races,
+      poolStarvation,
+      poolStarvationFindings: poolStarvation,
+    };
+    const remediation = preset
+      ? remediateScenario(preset)
+      : generateRemediationPlan(events, deadlocks, races);
+    const offendingCodeLines = collectOffendingCodeLines(deadlocks, raceAnalysis);
+    for (const ev of events) {
+      if (ev.file && Number.isInteger(ev.line) && ev.line >= 1) {
+        const ref: SourceCodeReference = { file: ev.file, line: ev.line };
+        if (!offendingCodeLines.some((item) => item.file === ref.file && item.line === ref.line)) {
+          offendingCodeLines.push(ref);
+        }
+      }
+    }
+    const source: AnalysisSource = preset
+      ? { kind: 'preset', scenarioId: preset.id, scenarioName: preset.title }
+      : { kind: 'custom', scenarioId: 'custom-trace', scenarioName: 'Custom Lock Trace' };
+
+    return {
+      source,
+      scenario: preset ?? { id: 'custom-trace', title: 'Custom Lock Trace', events },
+      events,
+      graph: {
+        executionNodes: wfg.executionNodes,
+        resourceNodes: wfg.resourceNodes,
+        acquisitions: wfg.acquisitions,
+        waitForEdges: wfg.waitForEdges,
+        nodes: wfg.nodes,
+        edges: wfg.edges,
+      },
+      nodes: wfg.nodes,
+      edges: wfg.edges,
+      deadlocks,
+      detectedCycles: deadlocks.map((d) => [...d.cycle]),
+      cycles: deadlocks,
+      raceAnalysis,
+      races,
+      dataRaces: races,
+      poolStarvation,
+      starvation: poolStarvation,
+      offendingCodeLines,
+      offendingLines: offendingCodeLines,
+      patch: remediation.unifiedDiff,
+      patchDiff: remediation.unifiedDiff,
+      diff: remediation.unifiedDiff,
+      unifiedDiff: remediation.unifiedDiff,
+      remediation,
+      remediationPlan: remediation,
+      incidentChecklist: remediation.runbookMarkdown,
+      checklist: remediation.runbookMarkdown,
+      runbook: remediation.runbookMarkdown,
+      runbookMarkdown: remediation.runbookMarkdown,
+    };
+  }
+
   let scenario: IncidentScenario | JsonRecord;
   let graphSnapshot: WaitForGraphSnapshot;
   let parsedEvents: ParsedTraceEvent[] = [];
   let source: AnalysisSource;
   let raceInput: RaceAnalysisInput;
 
-  if (presetId !== undefined) {
-    const preset = getScenarioPreset(presetId);
-    if (preset === undefined) throw new HttpError(404, `Unknown scenario preset "${presetId}"`, 'SCENARIO_NOT_FOUND');
-    scenario = preset;
-    graphSnapshot = snapshotForPreset(preset);
-    raceInput = raceInputForPreset(preset);
-    source = { kind: 'preset', scenarioId: preset.id, scenarioName: preset.title };
+  const graphCandidate = graphCandidateFromBody(body);
+  if (graphCandidate !== undefined) {
+    graphSnapshot = snapshotFromGraphCandidate(graphCandidate);
+    parsedEvents = parseTraceEvents(racePayloadFromBody(body));
   } else {
-    const graphCandidate = graphCandidateFromBody(body);
-    if (graphCandidate !== undefined) {
-      graphSnapshot = snapshotFromGraphCandidate(graphCandidate);
-      parsedEvents = parseTraceEvents(racePayloadFromBody(body));
-    } else {
-      parsedEvents = parseTraceEvents(tracePayloadFromBody(body));
-      if (parsedEvents.length === 0) throw new HttpError(400, 'Request must contain a preset ID, graph, or lock-event trace', 'INVALID_ANALYZE_REQUEST');
-      graphSnapshot = snapshotFromTraceEvents(parsedEvents);
-    }
-    raceInput = parsedEvents.length > 0
-      ? raceInputFromEvents(parsedEvents)
-      : raceInputFromEvents(parseTraceEvents(racePayloadFromBody(body)));
-    const preliminaryRaceAnalysis = analyzeRaceTrace(raceInput);
-    scenario = customScenario(body, graphSnapshot, parsedEvents, preliminaryRaceAnalysis);
-    source = {
-      kind: 'custom',
-      scenarioId: String(scenario.id),
-      scenarioName: String(scenario.title),
-    };
+    parsedEvents = parseTraceEvents(tracePayloadFromBody(body));
+    if (parsedEvents.length === 0) throw new HttpError(400, 'Request must contain a preset ID, graph, or lock-event trace', 'INVALID_ANALYZE_REQUEST');
+    graphSnapshot = snapshotFromTraceEvents(parsedEvents);
   }
+  raceInput = parsedEvents.length > 0
+    ? raceInputFromEvents(parsedEvents)
+    : raceInputFromEvents(parseTraceEvents(racePayloadFromBody(body)));
+  const preliminaryRaceAnalysis = analyzeRaceTrace(raceInput);
+  scenario = customScenario(body, graphSnapshot, parsedEvents, preliminaryRaceAnalysis);
+  source = {
+    kind: 'custom',
+    scenarioId: String(scenario.id),
+    scenarioName: String(scenario.title),
+  };
 
   const deadlocks = detectDeadlocks(graphSnapshot);
   const raceAnalysis = analyzeRaceTrace(raceInput);
   const remediation = remediateScenario(scenario);
   const offendingCodeLines = collectOffendingCodeLines(deadlocks, raceAnalysis);
   const graph = graphWithAliases(graphSnapshot);
-  const cycles = deadlocks.map((finding) => [...finding.cycle]);
+  const detectedCycles = deadlocks.map((finding) => [...finding.cycle]);
 
   return {
     source,
     scenario,
+    events: [],
     graph,
     nodes: graph.nodes,
     edges: graph.edges,
     deadlocks,
-    detectedCycles: cycles,
-    cycles,
+    detectedCycles,
+    cycles: deadlocks,
     raceAnalysis,
     races: raceAnalysis.races,
     dataRaces: raceAnalysis.dataRaces,
     poolStarvation: raceAnalysis.poolStarvation,
+    starvation: raceAnalysis.poolStarvation,
     offendingCodeLines,
     offendingLines: offendingCodeLines,
     patch: remediation.patchText,
     patchDiff: remediation.diffText,
     diff: remediation.diffText,
+    unifiedDiff: remediation.unifiedDiff,
     remediation,
+    remediationPlan: remediation,
     incidentChecklist: remediation.runbook,
     checklist: remediation.checklist,
     runbook: remediation.runbook,
+    runbookMarkdown: remediation.runbookMarkdown,
   };
 }
 
@@ -968,11 +1075,20 @@ function configuredWorkerCount(): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_WORKER_COUNT;
 }
 
-function benchmarkScenario(scenario: IncidentScenario): BenchmarkComparison {
-  const workerCount = configuredWorkerCount();
+function benchmarkScenario(scenario: IncidentScenario, customWorkers?: number): BenchmarkComparison {
+  const workerCount = customWorkers ?? configuredWorkerCount();
   const options = { workerCount } as const;
-  const before = simulateScenario(scenario, { ...options, patched: false });
-  const after = simulateScenario(scenario, { ...options, patched: true });
+  const simBefore = simulateScenario(scenario, { ...options, patched: false });
+  const simAfter = simulateScenario(scenario, { ...options, patched: true });
+  const chaos = runChaosBenchmark(scenario, workerCount);
+  const before = {
+    ...simBefore,
+    ...chaos.before,
+  };
+  const after = {
+    ...simAfter,
+    ...chaos.after,
+  };
   const comparison = {
     throughputRps: metricComparison(before.throughputRps, after.throughputRps),
     latencyMs: {
@@ -990,6 +1106,7 @@ function benchmarkScenario(scenario: IncidentScenario): BenchmarkComparison {
     workers: workerCount,
     before,
     after,
+    improvementFactor: chaos.improvementFactor,
     comparison,
     metrics: comparison,
   };
@@ -999,14 +1116,34 @@ function benchmarkBody(body: unknown, request: Request): {
   readonly benchmarks: readonly BenchmarkComparison[];
   readonly selected?: BenchmarkComparison;
 } {
+  const requestedWorkers = isRecord(body) && typeof body.workers === 'number' && body.workers > 0
+    ? Math.round(body.workers)
+    : undefined;
+  const customEvents = extractCustomLockEvents(body);
+  if (customEvents !== undefined) {
+    const fallbackPreset = INCIDENT_PRESETS[0];
+    const baseComparison = benchmarkScenario(fallbackPreset, requestedWorkers);
+    const chaos = runChaosBenchmark(customEvents, requestedWorkers ?? configuredWorkerCount());
+    const selected: BenchmarkComparison = {
+      ...baseComparison,
+      scenarioId: 'custom-trace',
+      scenarioName: 'Custom Lock Trace',
+      before: { ...baseComparison.before, ...chaos.before },
+      after: { ...baseComparison.after, ...chaos.after },
+      improvementFactor: chaos.improvementFactor,
+    };
+    return { benchmarks: [selected], selected };
+  }
+
   const id = presetIdFromRequest(body, request);
   if (id !== undefined) {
     const scenario = getScenarioPreset(id);
     if (scenario === undefined) throw new HttpError(404, `Unknown scenario preset "${id}"`, 'SCENARIO_NOT_FOUND');
-    const selected = benchmarkScenario(scenario);
+    const selected = benchmarkScenario(scenario, requestedWorkers);
     return { benchmarks: [selected], selected };
   }
-  return { benchmarks: INCIDENT_PRESETS.map(benchmarkScenario) };
+  const all = INCIDENT_PRESETS.map((preset) => benchmarkScenario(preset, requestedWorkers));
+  return { benchmarks: all, selected: all[0] };
 }
 
 function configuredPort(): number {
@@ -1022,6 +1159,10 @@ function configuredHost(): string {
 function frontendDirectory(options: ServerOptions): string {
   if (options.staticDir !== undefined) return resolve(options.staticDir);
   const currentDirectory = resolve(fileURLToPath(new URL('.', import.meta.url)));
+  const distClient = resolve(currentDirectory, '../../dist/client');
+  if (existsSync(resolve(distClient, 'index.html'))) {
+    return distClient;
+  }
   return resolve(currentDirectory, '../../dist');
 }
 
@@ -1062,9 +1203,10 @@ function healthPayload(staticDir: string): JsonRecord {
   };
   return {
     status: 'ok',
+    engine: 'DeadlockZero-SCC-v1',
+    offlineReady: true,
     service: 'deadlockzero-api',
     version: SERVER_VERSION,
-    engine: 'ready',
     metrics,
     engineMetrics: metrics,
   };
@@ -1076,6 +1218,7 @@ export function createApp(options: ServerOptions = {}): Express {
   const staticDir = frontendDirectory(options);
 
   app.disable('x-powered-by');
+  app.use(cors());
   app.use(express.json({ limit: JSON_BODY_LIMIT }));
   app.use(express.text({ type: ['text/plain', 'text/*'], limit: JSON_BODY_LIMIT }));
 
@@ -1103,21 +1246,16 @@ export function createApp(options: ServerOptions = {}): Express {
   app.post('/api/benchmark', (request, response) => {
     try {
       const result = benchmarkBody(request.body, request);
-      if (result.selected !== undefined) {
-        response.status(200).json({
-          ...result.selected,
-          benchmark: result.selected,
-          comparisons: [result.selected],
-        });
-        return;
-      }
+      const selected = result.selected ?? result.benchmarks[0];
       const workerCount = configuredWorkerCount();
       response.status(200).json({
+        ...selected,
+        benchmark: selected,
         benchmarks: result.benchmarks,
         comparisons: result.benchmarks,
         count: result.benchmarks.length,
-        workerCount,
-        workers: workerCount,
+        workerCount: selected?.workerCount ?? workerCount,
+        workers: selected?.workers ?? workerCount,
       });
     } catch (error) {
       sendError(response, error);
@@ -1178,3 +1316,6 @@ export function startServer(options: StartServerOptions = {}): Server {
   });
   return server;
 }
+
+export const app = createApp();
+export default app;
