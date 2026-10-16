@@ -144,7 +144,7 @@ function App() {
   };
 
   return (
-    <main className="war-room-shell">
+    <main className="war-room-shell min-h-screen">
       <header className="war-room-topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">DZ</span>
