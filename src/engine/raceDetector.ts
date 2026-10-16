@@ -1,6 +1,8 @@
 import type { SourceCodeReference } from './graph';
+import type { LockEvent, RaceConflict, StarvationAlert } from '../shared/types';
 
 export type { SourceCodeReference } from './graph';
+export type { RaceConflict, StarvationAlert } from '../shared/types';
 
 /** A source location is copied into every finding so callers can inspect it safely. */
 export type SourceLocation = SourceCodeReference;
@@ -138,6 +140,7 @@ export interface RaceTrace {
 
 export type RaceAnalysisInput =
   | readonly RaceEvent[]
+  | readonly LockEvent[]
   | readonly ConnectionPoolSample[]
   | RaceTrace
   | MemoryAccessEvent
@@ -474,6 +477,7 @@ function normalizeClock(
 function normalizeMode(record: Record<string, unknown>): MemoryAccessMode | undefined {
   const candidates = [
     record.mode,
+    record.action,
     record.kind,
     record.access,
     record.accessType,
@@ -492,8 +496,20 @@ function normalizeMode(record: Record<string, unknown>): MemoryAccessMode | unde
 
 type SyncKind = 'acquire' | 'release' | 'fork' | 'join' | 'sync';
 
+function isWaitAction(record: Record<string, unknown>): boolean {
+  const candidates = [record.action, record.kind, record.type, record.eventType, record.event];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const token = candidate.trim().toLowerCase().replace(/[_\s-]/g, '');
+    if (token === 'wait' || token === 'waitfor' || token === 'lockwait' || token === 'waiting') {
+      return true;
+    }
+  }
+  return false;
+}
+
 function normalizeSyncKind(record: Record<string, unknown>): SyncKind | undefined {
-  const candidates = [record.kind, record.type, record.eventType, record.event];
+  const candidates = [record.action, record.kind, record.type, record.eventType, record.event];
   for (const candidate of candidates) {
     if (typeof candidate !== 'string') continue;
     const kind = candidate.trim().toLowerCase().replace(/[_\s-]/g, '');
@@ -529,7 +545,7 @@ function normalizeSyncKind(record: Record<string, unknown>): SyncKind | undefine
 function normalizeKey(record: Record<string, unknown>, context: string): string {
   return requiredIdentifier(
     record,
-    ['location', 'address', 'resourceKey', 'resource', 'memoryAddress'],
+    ['location', 'address', 'resourceKey', 'resource', 'resourceId', 'memoryAddress'],
     `${context}.location`,
   );
 }
@@ -544,6 +560,7 @@ interface NormalizedAccess {
   readonly lockIds: readonly string[];
   readonly logicalTimestamp?: number;
   readonly clock: VectorClockSnapshot;
+  readonly codeSnippet?: string;
 }
 
 interface NormalizedSync {
@@ -572,7 +589,7 @@ function normalizeAccess(record: Record<string, unknown>, index: number): Omit<N
   const context = `access event ${index}`;
   const threadId = requiredIdentifier(
     record,
-    ['threadId', 'executionId', 'thread'],
+    ['threadId', 'workerId', 'executionId', 'thread'],
     `${context}.threadId`,
   );
   const location = normalizeKey(record, context);
@@ -585,6 +602,7 @@ function normalizeAccess(record: Record<string, unknown>, index: number): Omit<N
     ['logicalTimestamp', 'logicalTime', 'timestamp'],
     `${context}.logicalTimestamp`,
   );
+  const codeSnippet = typeof record.codeSnippet === 'string' ? record.codeSnippet : undefined;
   return {
     index,
     id: eventId(record, index),
@@ -595,13 +613,14 @@ function normalizeAccess(record: Record<string, unknown>, index: number): Omit<N
     lockIds: locks,
     logicalTimestamp,
     providedClock: normalizeClock(record, context),
+    codeSnippet,
   };
 }
 
 function endpointIdentifier(value: unknown, fieldName: string): string | undefined {
   if (value === undefined) return undefined;
   if (isRecord(value)) {
-    return optionalIdentifier(value, ['threadId', 'executionId', 'id', 'name'], fieldName);
+    return optionalIdentifier(value, ['threadId', 'workerId', 'executionId', 'id', 'name'], fieldName);
   }
   return normalizeIdentifierValue(value, fieldName);
 }
@@ -610,7 +629,7 @@ function normalizeSync(record: Record<string, unknown>, index: number): Normaliz
   const context = `synchronization event ${index}`;
   const kind = normalizeSyncKind(record);
   if (kind === undefined) throw new Error(`${context}.kind is not a supported synchronization kind`);
-  const threadValue = firstDefined(record, ['threadId', 'executionId', 'thread']);
+  const threadValue = firstDefined(record, ['threadId', 'workerId', 'executionId', 'thread']);
   const threadId =
     threadValue === undefined
       ? undefined
@@ -621,7 +640,7 @@ function normalizeSync(record: Record<string, unknown>, index: number): Normaliz
     ['logicalTimestamp', 'logicalTime', 'timestamp'],
     `${context}.logicalTimestamp`,
   );
-  const lockValue = firstDefined(record, ['lockId', 'lock', 'resourceKey', 'resource']);
+  const lockValue = firstDefined(record, ['lockId', 'lock', 'resourceKey', 'resource', 'resourceId']);
   const lockId = lockValue === undefined ? undefined : normalizeIdentifierValue(lockValue, `${context}.lockId`);
   const otherValue = firstDefined(record, ['otherThreadId']);
   const otherThreadId = endpointIdentifier(otherValue, `${context}.otherThreadId`);
@@ -937,6 +956,10 @@ function normalizeInput(input: RaceAnalysisInput | undefined): {
   const pools: NormalizedPoolSample[] = [];
   const state = newRuntimeState();
   const records = rawEvents(input);
+  const allWorkers = new Set<string>();
+  const waitingWorkersByResource = new Map<string, Set<string>>();
+  const waitSourcesByResource = new Map<string, SourceCodeReference | undefined>();
+  const waitTimestampByResource = new Map<string, number>();
 
   records.forEach((value, index) => {
     if (!isRecord(value)) throw new Error(`event ${index} must be an object`);
@@ -945,11 +968,33 @@ function normalizeInput(input: RaceAnalysisInput | undefined): {
       return;
     }
 
+    const workerIdCandidate = firstDefined(value, ['workerId', 'threadId', 'executionId', 'thread']);
+    if (typeof workerIdCandidate === 'string' && workerIdCandidate.trim().length > 0) {
+      allWorkers.add(workerIdCandidate.trim());
+    }
+
+    if (isWaitAction(value)) {
+      const worker = typeof workerIdCandidate === 'string' ? workerIdCandidate.trim() : undefined;
+      const resource = firstDefined(value, ['resourceId', 'lockId', 'resource', 'lock']);
+      if (worker && typeof resource === 'string' && resource.trim().length > 0) {
+        const resId = resource.trim();
+        const waiters = waitingWorkersByResource.get(resId) ?? new Set<string>();
+        waiters.add(worker);
+        waitingWorkersByResource.set(resId, waiters);
+        if (!waitSourcesByResource.has(resId)) {
+          waitSourcesByResource.set(resId, normalizeSource(value, `wait event ${index}`));
+        }
+        const ts = optionalNonNegativeNumber(value, ['timestamp', 'observedAt', 'logicalTimestamp'], `wait event ${index}.timestamp`) ?? index;
+        waitTimestampByResource.set(resId, ts);
+      }
+      return;
+    }
+
     const mode = normalizeMode(value);
     const syncKind = normalizeSyncKind(value);
     if (
       syncKind === undefined &&
-      (mode !== undefined || firstDefined(value, ['location', 'address', 'resourceKey', 'resource']) !== undefined)
+      (mode !== undefined || firstDefined(value, ['location', 'address', 'resourceKey', 'resource', 'resourceId']) !== undefined)
     ) {
       const normalized = normalizeAccess(value, index);
       const clock =
@@ -971,12 +1016,17 @@ function normalizeInput(input: RaceAnalysisInput | undefined): {
         lockIds: locks,
         logicalTimestamp: normalized.logicalTimestamp,
         clock,
+        codeSnippet: normalized.codeSnippet,
       });
       return;
     }
 
     if (syncKind !== undefined) {
-      syncClocks(state, normalizeSync(value, index));
+      const syncEvent = normalizeSync(value, index);
+      if (syncEvent.kind === 'release' && syncEvent.lockId) {
+        waitingWorkersByResource.delete(syncEvent.lockId);
+      }
+      syncClocks(state, syncEvent);
       return;
     }
 
@@ -988,6 +1038,27 @@ function normalizeInput(input: RaceAnalysisInput | undefined): {
       throw new Error(`event ${index} is not a valid memory or synchronization event`);
     }
   });
+
+  // Detect Connection Pool / Resource Starvation when >80% of workers are blocked in WAIT on the same resource
+  if (allWorkers.size >= 2) {
+    for (const [resourceId, waiters] of waitingWorkersByResource.entries()) {
+      const ratio = waiters.size / allWorkers.size;
+      if (ratio > 0.8 && waiters.size >= 2) {
+        const capacity = Math.max(1, allWorkers.size - waiters.size);
+        const ts = waitTimestampByResource.get(resourceId) ?? 1000;
+        pools.push({
+          index: pools.length,
+          id: `starvation:${resourceId}`,
+          poolId: resourceId,
+          capacity,
+          inUse: capacity,
+          queued: waiters.size,
+          observedAt: ts,
+          source: waitSourcesByResource.get(resourceId),
+        });
+      }
+    }
+  }
 
   return { accesses, pools };
 }
@@ -1013,7 +1084,7 @@ export interface RaceAccessEvidence {
 export type RaceConflictKind = 'read-write' | 'write-write';
 export type RaceAccessPattern = 'read-write' | 'write-read' | 'write-write';
 
-export interface RaceFinding {
+export interface RaceFinding extends RaceConflict {
   readonly id: string;
   readonly kind: 'data-race';
   readonly conflictKind: RaceConflictKind;
@@ -1022,6 +1093,13 @@ export interface RaceFinding {
   readonly location: string;
   readonly address: string;
   readonly resourceKey: string;
+  readonly resourceId: string;
+  readonly workerA: string;
+  readonly workerB: string;
+  readonly eventA: LockEvent;
+  readonly eventB: LockEvent;
+  readonly vectorClockA: Record<string, number>;
+  readonly vectorClockB: Record<string, number>;
   readonly accessIds: readonly [string, string];
   readonly threadIds: readonly [string, string];
   readonly executionIds: readonly [string, string];
@@ -1044,6 +1122,20 @@ export interface RaceFinding {
   readonly commonLocks: readonly string[];
   readonly explanation: string;
   readonly clockExplanation: string;
+}
+
+function toLockEvent(access: NormalizedAccess): LockEvent {
+  return {
+    id: access.id,
+    workerId: access.threadId,
+    resourceId: access.location,
+    action: access.mode === 'write' ? 'WRITE' : 'READ',
+    timestamp: access.logicalTimestamp ?? access.index,
+    vectorClock: { ...access.clock },
+    file: access.source?.file ?? 'unknown',
+    line: access.source?.line ?? 1,
+    codeSnippet: access.codeSnippet ?? `${access.mode.toUpperCase()} ${access.location}`,
+  };
 }
 
 function evidence(access: NormalizedAccess): RaceAccessEvidence {
@@ -1103,6 +1195,13 @@ function buildRaceFinding(left: NormalizedAccess, right: NormalizedAccess): Race
     location: left.location,
     address: left.location,
     resourceKey: left.location,
+    resourceId: left.location,
+    workerA: left.threadId,
+    workerB: right.threadId,
+    eventA: toLockEvent(left),
+    eventB: toLockEvent(right),
+    vectorClockA: { ...left.clock },
+    vectorClockB: { ...right.clock },
     accessIds: [left.id, right.id],
     threadIds: [left.threadId, right.threadId],
     executionIds: [left.threadId, right.threadId],

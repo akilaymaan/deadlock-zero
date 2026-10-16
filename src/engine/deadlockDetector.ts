@@ -1,13 +1,18 @@
-import { WaitForGraph } from './graph';
+import { buildWaitForGraph, WaitForGraph } from './graph';
 import type {
   AcquisitionRecord,
+  BuiltWaitForGraph,
   ExecutionNode,
   GraphId,
+  LockEvent,
   ResourceNode,
   SourceCodeReference,
   WaitForEdge,
   WaitForGraphSnapshot,
 } from './graph';
+import type { DeadlockCycle, OffendingLine } from '../shared/types';
+
+export type { DeadlockCycle, OffendingLine } from '../shared/types';
 
 /** A snapshot is intentionally accepted as well as the mutable graph class. */
 export type ReadonlyWaitForGraphSnapshot = {
@@ -20,7 +25,9 @@ export type ReadonlyWaitForGraphSnapshot = {
 export type WaitForGraphInput =
   | WaitForGraph
   | WaitForGraphSnapshot
-  | ReadonlyWaitForGraphSnapshot;
+  | ReadonlyWaitForGraphSnapshot
+  | BuiltWaitForGraph
+  | readonly LockEvent[];
 
 /** Vertex ids in one strongly connected component, in deterministic order. */
 export type StronglyConnectedComponent = GraphId[];
@@ -71,13 +78,17 @@ export interface HoldAndWaitChainLink {
   sourceLocations: DeadlockSourceLocations;
 }
 
-export interface DeadlockFinding {
+export interface DeadlockFinding extends DeadlockCycle {
   /** Stable id derived from the canonical cycle vertex sequence. */
   id: string;
   /** Canonical cycle vertex ids; the closing vertex is not repeated. */
   cycle: ElementaryCycle;
   cycleNodeIds: GraphId[];
   executionIds: GraphId[];
+  /** Alternating Worker -> Resource -> Worker cycle path including closing node. */
+  cycleNodes: GraphId[];
+  offendingLines: OffendingLine[];
+  explanation: string;
 
   /** Execution nodes are in the same order as `cycle`. */
   executionNodes: ExecutionNode[];
@@ -220,11 +231,31 @@ function compareWaitEdges(left: WaitForEdge, right: WaitForEdge): number {
   );
 }
 
+function isLockEventArray(graph: WaitForGraphInput): graph is readonly LockEvent[] {
+  return Array.isArray(graph);
+}
+
+function isBuiltWaitForGraph(graph: WaitForGraphInput): graph is BuiltWaitForGraph {
+  return (
+    !Array.isArray(graph) &&
+    !(graph instanceof WaitForGraph) &&
+    'nodes' in graph &&
+    'edges' in graph &&
+    'hops' in graph
+  );
+}
+
 function snapshotOf(graph: WaitForGraphInput): ReadonlyWaitForGraphSnapshot {
+  if (isLockEventArray(graph)) {
+    return buildWaitForGraph(graph);
+  }
   if (graph instanceof WaitForGraph) {
     return graph.toJSON();
   }
-  return graph;
+  if (isBuiltWaitForGraph(graph) && !('executionNodes' in graph)) {
+    return buildWaitForGraph(graph.events);
+  }
+  return graph as ReadonlyWaitForGraphSnapshot;
 }
 
 /**
@@ -646,6 +677,7 @@ function buildFinding(
   normalized: NormalizedGraph,
   cycle: ElementaryCycle,
   component: StronglyConnectedComponent,
+  builtGraph?: BuiltWaitForGraph,
 ): DeadlockFinding {
   const holdAndWaitChain = cycle.map((waiterId, index) =>
     buildChainLink(
@@ -701,11 +733,85 @@ function buildFinding(
   const executions = executionNodes.map(cloneExecutionNode);
   const nodes = executionNodes.map(cloneExecutionNode);
 
+  const cycleNodes: GraphId[] = [];
+  const offendingLines: OffendingLine[] = [];
+  const seenOffending = new Set<string>();
+
+  const pushOffending = (item: OffendingLine): void => {
+    const key = `${item.file}:${item.line}:${item.workerId ?? ''}:${item.resourceId ?? ''}:${item.action ?? ''}`;
+    if (!seenOffending.has(key)) {
+      seenOffending.add(key);
+      offendingLines.push(item);
+    }
+  };
+
+  for (const link of chain) {
+    cycleNodes.push(link.waiterId);
+    if (link.resourceId) {
+      cycleNodes.push(link.resourceId);
+    }
+    const matchingHop = builtGraph?.hops.find(
+      (hop) =>
+        hop.fromWorker === link.waiterId &&
+        hop.toWorker === link.holderId &&
+        hop.resourceId === link.resourceId,
+    );
+    if (matchingHop?.holdEvent) {
+      pushOffending({
+        file: matchingHop.holdEvent.file,
+        line: matchingHop.holdEvent.line,
+        snippet: matchingHop.holdEvent.codeSnippet,
+        workerId: matchingHop.holdEvent.workerId,
+        resourceId: matchingHop.holdEvent.resourceId,
+        action: matchingHop.holdEvent.action,
+      });
+    } else if (link.acquisitionSource) {
+      pushOffending({
+        file: link.acquisitionSource.file,
+        line: link.acquisitionSource.line,
+        snippet: `${link.holderId} holds ${link.resourceId}`,
+        workerId: link.holderId,
+        resourceId: link.resourceId,
+        action: 'ACQUIRE',
+      });
+    }
+
+    if (matchingHop?.waitEvent) {
+      pushOffending({
+        file: matchingHop.waitEvent.file,
+        line: matchingHop.waitEvent.line,
+        snippet: matchingHop.waitEvent.codeSnippet,
+        workerId: matchingHop.waitEvent.workerId,
+        resourceId: matchingHop.waitEvent.resourceId,
+        action: matchingHop.waitEvent.action,
+      });
+    } else if (link.waitSource) {
+      pushOffending({
+        file: link.waitSource.file,
+        line: link.waitSource.line,
+        snippet: `${link.waiterId} waits for ${link.resourceId} held by ${link.holderId}`,
+        workerId: link.waiterId,
+        resourceId: link.resourceId,
+        action: 'WAIT',
+      });
+    }
+  }
+  if (cycle.length > 0) {
+    cycleNodes.push(cycle[0]);
+  }
+
+  const explanation =
+    `Tarjan's SCC & Johnson's cycle detector identified a circular wait across ${cycle.length} worker(s): ` +
+    `${cycleNodes.join(' -> ')}.`;
+
   return {
     id: JSON.stringify(cycle),
     cycle: [...cycle],
     cycleNodeIds: [...cycle],
     executionIds: [...cycle],
+    cycleNodes,
+    offendingLines,
+    explanation,
     executionNodes,
     executions,
     nodes,
@@ -729,11 +835,18 @@ function buildFinding(
 
 /**
  * Detect every simple directed deadlock cycle and attach its wait/hold source
- * evidence. The input graph is copied and is never mutated.
+ * evidence. The input graph is copied and is never mutated, except when a
+ * BuiltWaitForGraph is passed, whose `inCycle` flags are updated in place.
  */
 export function detectDeadlocks(graph: WaitForGraphInput): DeadlockFinding[] {
-  const normalized = normalizeGraph(graph);
-  const cycles = findElementaryCycles(graph);
+  const builtGraph = isLockEventArray(graph)
+    ? buildWaitForGraph(graph)
+    : isBuiltWaitForGraph(graph)
+      ? graph
+      : undefined;
+  const effectiveInput = builtGraph && 'executionNodes' in builtGraph ? builtGraph : graph;
+  const normalized = normalizeGraph(effectiveInput);
+  const cycles = findElementaryCycles(effectiveInput);
   if (cycles.length === 0) {
     return [];
   }
@@ -742,15 +855,41 @@ export function detectDeadlocks(graph: WaitForGraphInput): DeadlockFinding[] {
     normalized.executionIds,
     normalized.adjacency,
   );
-  return cycles
+  const findings = cycles
     .map((cycle) => {
       const component =
         components.find((candidate) =>
           cycle.every((vertex) => candidate.includes(vertex)),
         ) ?? cycle;
-      return buildFinding(normalized, cycle, component);
+      return buildFinding(normalized, cycle, component, builtGraph);
     })
     .sort((left, right) => compareCycles(left.cycle, right.cycle));
+
+  if (builtGraph && isBuiltWaitForGraph(graph)) {
+    const cycleMemberIds = new Set<string>();
+    const cycleHops = new Set<string>();
+    for (const finding of findings) {
+      for (const nodeId of finding.cycleNodes) {
+        cycleMemberIds.add(nodeId);
+      }
+      for (const link of finding.holdAndWaitChain) {
+        cycleHops.add(`WAIT:${link.waiterId}->${link.resourceId}`);
+        cycleHops.add(`HOLD:${link.resourceId}->${link.holderId}`);
+      }
+    }
+    for (const node of graph.nodes) {
+      node.inCycle = cycleMemberIds.has(node.id);
+    }
+    for (const edge of graph.edges) {
+      if (edge.relation === 'WAITS_FOR') {
+        edge.inCycle = cycleHops.has(`WAIT:${edge.from}->${edge.to}`);
+      } else if (edge.relation === 'HOLDS') {
+        edge.inCycle = cycleHops.has(`HOLD:${edge.from}->${edge.to}`);
+      }
+    }
+  }
+
+  return findings;
 }
 
 /** Convenience wrapper for callers that prefer an object-oriented detector. */
