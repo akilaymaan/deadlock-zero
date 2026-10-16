@@ -1,5 +1,9 @@
 # DeadlockZero
 
+[![CI](https://github.com/akilaymaan/deadlock-zero/actions/workflows/ci.yml/badge.svg)](https://github.com/akilaymaan/deadlock-zero/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/akilaymaan/deadlock-zero)](./LICENSE)
+[![Node.js ≥ 22](https://img.shields.io/badge/node-%E2%89%A522-339933)](./package.json)
+
 DeadlockZero analyzes lock traces from concurrent programs. Give it a list of lock and memory events (which worker acquired, waited on, released, read, or wrote which resource), and it:
 
 - builds the **wait-for graph** and finds every **deadlock cycle** (Tarjan's strongly connected components, then Johnson's elementary cycles);
