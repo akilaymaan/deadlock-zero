@@ -1,5 +1,27 @@
+# Dependencies
 node_modules/
+
+# Build output
 dist/
+*.tsbuildinfo
+.vite/
+
+# Test output
 coverage/
+
+# Environment and secrets (keep the template)
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS and editor
 .DS_Store
+Thumbs.db
+.idea/
+*.swp

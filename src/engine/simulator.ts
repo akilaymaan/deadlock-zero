@@ -1,963 +1,482 @@
 /**
- * Deterministic, virtual-time incident simulation.
+ * Deterministic virtual-time lock scheduling simulator.
  *
- * The simulator intentionally does not use timers. A run is a calculation over
- * a finite request set, which makes it safe to use in the UI, tests, and CI.
- * Scenario objects are read structurally so that this module can consume both
- * the shared preset contract and hand-authored incident fixtures.
+ * Each worker that appears in an ingested trace becomes a "program": the ordered
+ * list of lock acquisitions (ACQUIRE / WAIT) and memory accesses (READ / WRITE) it
+ * performed. N virtual workers replay those programs round-robin under a seeded
+ * random scheduler with real lock ownership semantics:
+ *
+ * - A lock step succeeds only if the resource is free (or already held by the worker).
+ * - A worker blocked for at least `deadlockDetectionMs` triggers wait-for cycle
+ *   detection (like PostgreSQL's `deadlock_timeout`); one victim per cycle is aborted.
+ * - A worker blocked for `lockTimeoutMs` aborts its request.
+ * - An access to a resource the worker does not hold a lock on is "unprotected";
+ *   two in-flight requests touching the same resource unprotected, where at least
+ *   one writes, is counted as a race and both requests fail.
+ *
+ * The "after" run applies the remediation the tool recommends: every lock set is
+ * acquired in one canonical (sorted) order and every unprotected resource gets a
+ * guard lock. The model captures ordering and synchronization only; it does not know
+ * real I/O or critical-section durations, so it is not a substitute for a load test.
  */
 
 import type {
   ChaosBenchmarkResult,
   LockEvent,
+  SimulationConfig,
   SimulationMetrics,
 } from '../shared/types';
-import { detectDeadlocks } from './deadlockDetector';
-import { detectRaces, detectStarvation } from './raceDetector';
 
-export type { ChaosBenchmarkResult, SimulationMetrics } from '../shared/types';
+export type { ChaosBenchmarkResult, SimulationConfig, SimulationMetrics } from '../shared/types';
 
 export const DEFAULT_WORKER_COUNT = 500;
-export const DEFAULT_DURATION_MS = 1_000;
-export const DEFAULT_SEED = 0xdead10cc;
 
-type RecordLike = { readonly [key: string]: unknown };
+export const SIMULATION_DEFAULTS = {
+  requestsPerWorker: 3,
+  lockTimeoutMs: 10_000,
+  deadlockDetectionMs: 1_000,
+  workMs: 2,
+  maxVirtualMs: 60_000,
+} as const;
 
-/** A deliberately permissive view of the scenario contract. */
-export interface IncidentScenario {
-  readonly id?: string;
-  readonly name?: string;
-  readonly title?: string;
-  readonly description?: string;
-  readonly type?: string;
-  readonly kind?: string;
-  readonly category?: string;
-  readonly [key: string]: unknown;
-}
-
-export type ScenarioInput = IncidentScenario | Readonly<Record<string, unknown>>;
-export type IncidentScenarioInput = ScenarioInput;
-export type SimulationMode = 'before' | 'after' | 'unpatched' | 'patched';
-export type PatchMode = 'before' | 'after';
-export type ScenarioSimulationResult = SimulationResult;
-export type SimulationOutput = SimulationResult;
+export const SIMULATION_LIMITS = {
+  maxWorkers: 5_000,
+  maxRequestsPerWorker: 20,
+  maxVirtualMs: 600_000,
+  /**
+   * Hard CPU budget per run, counted in worker scheduling steps (~0.5 s on a modern core).
+   * Runs that exceed it stop early and report `truncated: true`.
+   */
+  maxWorkerSteps: 15_000_000,
+} as const;
 
 export interface SimulationOptions {
-  /** Number of concurrent workers. Defaults to 500. */
-  readonly workerCount?: number;
-  readonly workers?: number;
-  readonly concurrentWorkers?: number;
-  /** Select the remediated path. `mode` is an equivalent spelling. */
-  readonly patched?: boolean;
-  readonly patchApplied?: boolean;
-  readonly patchedMode?: boolean;
-  readonly patchMode?: boolean;
-  readonly mode?: SimulationMode;
-  /** Virtual duration; no wall-clock delay is introduced. */
-  readonly durationMs?: number;
-  readonly duration?: number;
-  readonly durationSeconds?: number;
-  /** Seed for deterministic latency jitter. */
-  readonly seed?: number;
-  /** Optional request count; otherwise one request is generated per worker. */
-  readonly requestCount?: number;
-  readonly totalRequests?: number;
+  workers?: number;
+  requestsPerWorker?: number;
+  seed?: number;
+  lockTimeoutMs?: number;
+  deadlockDetectionMs?: number;
+  workMs?: number;
+  maxVirtualMs?: number;
 }
 
-export interface SimulationResult {
-  readonly scenarioId: string;
-  readonly scenarioName: string;
-  /** Normalized public mode (`before` means unpatched). */
-  readonly mode: PatchMode;
-  readonly patchMode: PatchMode;
-  readonly patched: boolean;
-  readonly patchApplied: boolean;
-  readonly beforeAfterPatch: PatchMode;
-  readonly state: 'unpatched' | 'patched';
-  readonly workerCount: number;
-  readonly workers: number;
-  readonly durationMs: number;
-  readonly requestedRequests: number;
-  readonly requests: number;
-  readonly requestCount: number;
-  readonly totalRequests: number;
-  readonly completedRequests: number;
-  readonly completed: number;
-  readonly droppedRequests: number;
-  readonly dropped: number;
-  readonly deadlockCount: number;
-  readonly deadlocks: number;
-  readonly throughputReqPerSec: number;
-  readonly throughputRps: number;
-  readonly throughput: number;
-  /** Phase capacity target; useful for before/after comparison cards. */
-  readonly healthyThroughput: number;
-  readonly fullThroughput: number;
-  readonly capacityThroughput: number;
-  readonly maxThroughput: number;
-  readonly p50LatencyMs: number;
-  readonly p95LatencyMs: number;
-  readonly p99LatencyMs: number;
-  readonly p50Latency: number;
-  readonly p95Latency: number;
-  readonly p99Latency: number;
-  readonly p50: number;
-  readonly p95: number;
-  readonly p99: number;
-  readonly latenciesMs: readonly number[];
-  readonly latencyMs: readonly number[];
-  readonly contentionRate: number;
-  readonly seed: number;
-  /** A compact operator handoff is included for callers rendering one result. */
-  readonly runbook: string;
-  readonly runbookMarkdown: string;
+export class SimulationInputError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'SimulationInputError';
+  }
 }
 
-interface ScenarioProfile {
-  readonly id: string;
-  readonly name: string;
-  readonly kind: string;
-  readonly locks: readonly string[];
-  readonly durationMs: number;
-  readonly requestCount?: number;
-  readonly requestsPerSecond?: number;
-  readonly serviceTimeMs?: number;
-  readonly contentionRate?: number;
-  readonly deadlockCount?: number;
-  readonly deadlockRate?: number;
-  readonly droppedRequests?: number;
-  readonly dropRate?: number;
-  readonly completedRequests?: number;
-  readonly p50LatencyMs?: number;
-  readonly p95LatencyMs?: number;
-  readonly p99LatencyMs?: number;
-}
+type Step =
+  | { readonly kind: 'lock'; readonly resource: string }
+  | { readonly kind: 'access'; readonly resource: string; readonly write: boolean };
 
-interface SimulationPhaseProfile {
-  readonly throughputRps?: number;
-  readonly p50LatencyMs?: number;
-  readonly p95LatencyMs?: number;
-  readonly p99LatencyMs?: number;
-  readonly deadlockRatePerMinute?: number;
-  readonly dropRate?: number;
-}
-
-interface ExplicitPercentiles {
-  readonly p50?: number;
-  readonly p95?: number;
-  readonly p99?: number;
-}
-
-function isRecord(value: unknown): value is RecordLike {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function normalizedKey(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function normalizedText(value: unknown): string {
-  return typeof value === 'string' ? value.trim().toLowerCase() : '';
-}
-
-function clamp(value: number, minimum: number, maximum: number): number {
-  return Math.min(maximum, Math.max(minimum, value));
-}
-
-function finiteNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function nonNegativeNumber(value: unknown): number | undefined {
-  const number = finiteNumber(value);
-  return number === undefined || number < 0 ? undefined : number;
-}
-
-function nonNegativeInteger(value: unknown): number | undefined {
-  const number = nonNegativeNumber(value);
-  return number === undefined || !Number.isInteger(number) ? undefined : number;
-}
-
-function stringValue(value: unknown): string | undefined {
-  if (typeof value === 'string' && value.trim().length > 0) return value.trim();
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  return undefined;
-}
-
-interface RecordCandidate {
-  readonly value: RecordLike;
-  readonly modePriority: boolean;
-  readonly depth: number;
-  readonly path: string;
-}
-
-const BEFORE_KEYS = new Set([
-  'before',
-  'beforepatch',
-  'unpatched',
-  'baseline',
-  'broken',
-  'prepatch',
-  'current',
-]);
-const AFTER_KEYS = new Set([
-  'after',
-  'afterpatch',
-  'patched',
-  'fixed',
-  'postpatch',
-  'remediated',
-  'resolved',
-]);
+type Program = readonly Step[];
 
 /**
- * Collect records in a stable order. Mode-specific metric blocks are searched
- * before the root, allowing `{ before: {...}, after: {...} }` metadata without
- * making any assumptions about the preset author's nesting style.
- */
-function recordCandidates(root: unknown, patched: boolean): RecordCandidate[] {
-  const result: RecordCandidate[] = [];
-  const visited = new Set<object>();
-  const visit = (value: unknown, depth: number, modePriority: boolean, path: string): void => {
-    if (!isRecord(value) || visited.has(value) || depth > 6) return;
-    visited.add(value);
-    result.push({ value, modePriority, depth, path });
-    for (const key of Object.keys(value).sort()) {
-      const child = value[key];
-      if (!isRecord(child) && !Array.isArray(child)) continue;
-      const keyName = normalizedKey(key);
-      const matchesMode = patched ? AFTER_KEYS.has(keyName) : BEFORE_KEYS.has(keyName);
-      const isOppositeMode = patched ? BEFORE_KEYS.has(keyName) : AFTER_KEYS.has(keyName);
-      visit(child, depth + 1, modePriority || (matchesMode && !isOppositeMode), `${path}.${key}`);
-    }
-  };
-  visit(root, 0, false, '$');
-  return result.sort(
-    (left, right) =>
-      Number(right.modePriority) - Number(left.modePriority) ||
-      left.depth - right.depth ||
-      (left.path < right.path ? -1 : left.path > right.path ? 1 : 0),
-  );
-}
-
-function directValue(record: RecordLike, aliases: readonly string[]): unknown {
-  const names = new Map(Object.keys(record).map((key) => [normalizedKey(key), key]));
-  for (const alias of aliases) {
-    const key = names.get(normalizedKey(alias));
-    if (key !== undefined && record[key] !== undefined) return record[key];
-  }
-  return undefined;
-}
-
-function findValue(root: unknown, aliases: readonly string[], patched: boolean): unknown {
-  for (const candidate of recordCandidates(root, patched)) {
-    const value = directValue(candidate.value, aliases);
-    if (value !== undefined) return value;
-  }
-  return undefined;
-}
-
-function findNumber(root: unknown, aliases: readonly string[], patched: boolean): number | undefined {
-  return finiteNumber(findValue(root, aliases, patched));
-}
-
-function findNonNegativeNumber(
-  root: unknown,
-  aliases: readonly string[],
-  patched: boolean,
-): number | undefined {
-  return nonNegativeNumber(findValue(root, aliases, patched));
-}
-
-function findString(root: unknown, aliases: readonly string[], patched = false): string | undefined {
-  return stringValue(findValue(root, aliases, patched));
-}
-
-function findArray(root: unknown, aliases: readonly string[], patched = false): readonly unknown[] | undefined {
-  const value = findValue(root, aliases, patched);
-  return Array.isArray(value) ? value : undefined;
-}
-
-function findNestedRecordValue(
-  root: unknown,
-  containerAliases: readonly string[],
-  valueAliases: readonly string[],
-): number | undefined {
-  const containers = new Set(containerAliases.map(normalizedKey));
-  const visited = new Set<object>();
-  const visit = (value: unknown, depth: number): number | undefined => {
-    if (!isRecord(value) || visited.has(value) || depth > 6) return undefined;
-    visited.add(value);
-    for (const key of Object.keys(value).sort()) {
-      const child = value[key];
-      if (!isRecord(child)) continue;
-      if (containers.has(normalizedKey(key))) {
-        const candidate = finiteNumber(directValue(child, valueAliases));
-        if (candidate !== undefined) return candidate;
-      }
-      const nested = visit(child, depth + 1);
-      if (nested !== undefined) return nested;
-    }
-    return undefined;
-  };
-  return visit(root, 0);
-}
-
-function asRate(value: number | undefined): number | undefined {
-  if (value === undefined) return undefined;
-  return clamp(value > 1 && value <= 100 ? value / 100 : value, 0, 1);
-}
-
-function compareStrings(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
-}
-
-function uniqueSorted(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim().length > 0))].sort(compareStrings);
-}
-
-function uniqueInOrder(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim().length > 0))];
-}
-
-function lockName(value: unknown): string | undefined {
-  const direct = stringValue(value);
-  if (direct !== undefined) return direct;
-  if (!isRecord(value)) return undefined;
-  for (const key of ['id', 'name', 'lockId', 'resourceId', 'key', 'label']) {
-    const result = stringValue(directValue(value, [key]));
-    if (result !== undefined) return result;
-  }
-  return undefined;
-}
-
-function extractLocks(scenario: unknown): string[] {
-  const explicit = findArray(
-    scenario,
-    [
-      'canonicalLockOrder',
-      'canonicalOrder',
-      'lockOrder',
-      'lockNames',
-      'locks',
-      'lockResources',
-      'mutexes',
-    ],
-  );
-  if (explicit !== undefined) {
-    return uniqueInOrder(explicit.map(lockName).filter((value): value is string => value !== undefined));
-  }
-
-  // The shared preset contract stores the safe ordering under
-  // `contention.resourceOrder`. It is a lock order only for lock/circular-RPC
-  // incidents; pool, race, and retry incidents intentionally use that field to
-  // describe a resource flow rather than mutexes.
-  const categoryText = ['id', 'name', 'title', 'type', 'kind', 'category']
-    .map((key) => findString(scenario, [key]) ?? '')
-    .join(' ')
-    .toLowerCase();
-  const contentionMode = findString(scenario, ['mode']);
-  if (
-    categoryText.includes('deadlock') ||
-    contentionMode === 'ordered-locks' ||
-    contentionMode === 'circular-rpc'
-  ) {
-    const resourceOrder = findArray(scenario, ['resourceOrder']);
-    if (resourceOrder !== undefined) {
-      return uniqueInOrder(resourceOrder.map(lockName).filter((value): value is string => value !== undefined));
-    }
-  }
-
-  const resources = findArray(scenario, ['resources', 'resourceNodes']);
-  if (resources !== undefined) {
-    const locks = resources
-      .filter((resource) => {
-        if (!isRecord(resource)) return true;
-        const kind = normalizedText(directValue(resource, ['kind', 'type', 'category']));
-        return kind.includes('lock') || kind.includes('mutex');
-      })
-      .map(lockName)
-      .filter((value): value is string => value !== undefined);
-    if (locks.length > 0) return uniqueSorted(locks);
-  }
-
-  return [];
-}
-
-function classifyScenario(scenario: unknown, locks: readonly string[]): string {
-  const values = ['id', 'name', 'title', 'type', 'kind', 'category', 'description']
-    .map((key) => findString(scenario, [key]))
-    .filter((value): value is string => value !== undefined)
-    .join(' ')
-    .toLowerCase();
-  if (values.includes('pool') || values.includes('starvation')) return 'pool-starvation';
-  if (values.includes('retry') || values.includes('storm')) return 'retry-storm';
-  if (values.includes('deadlock') || values.includes('lock') || locks.length > 0) return 'deadlock';
-  if (values.includes('race')) return 'race';
-  return 'contention';
-}
-
-function scenarioId(scenario: unknown): string {
-  return (
-    findString(scenario, ['id', 'scenarioId', 'key', 'slug']) ??
-    findString(scenario, ['name', 'title']) ??
-    'incident-scenario'
-  );
-}
-
-function scenarioName(scenario: unknown, id: string): string {
-  return findString(scenario, ['name', 'title', 'label']) ?? id;
-}
-
-function readDuration(scenario: unknown, options: SimulationOptions): number {
-  const option = options.durationMs ??
-    (options.durationSeconds === undefined ? options.duration : options.durationSeconds * 1_000);
-  const durationMs = findNonNegativeNumber(
-    scenario,
-    ['durationMs', 'durationMilliseconds', 'simulationDurationMs'],
-    false,
-  );
-  const durationSeconds = findNonNegativeNumber(
-    scenario,
-    ['durationSeconds', 'simulationDurationSeconds'],
-    false,
-  );
-  const scenarioDuration =
-    durationMs ??
-    (durationSeconds === undefined
-      ? findNonNegativeNumber(scenario, ['duration'], false)
-      : durationSeconds * 1_000);
-  const duration = option ?? scenarioDuration ?? DEFAULT_DURATION_MS;
-  if (!Number.isFinite(duration) || duration < 0) throw new Error('durationMs must be a non-negative finite number');
-  return duration;
-}
-
-function readWorkerCount(options: SimulationOptions): number {
-  const value = options.workerCount ?? options.workers ?? options.concurrentWorkers ?? DEFAULT_WORKER_COUNT;
-  if (!Number.isInteger(value) || value < 0 || !Number.isFinite(value)) {
-    throw new Error('workerCount must be a non-negative integer');
-  }
-  return value;
-}
-
-function readSeed(scenario: unknown, options: SimulationOptions): number {
-  const value = options.seed ?? findNonNegativeNumber(scenario, ['seed', 'randomSeed'], false) ?? DEFAULT_SEED;
-  if (!Number.isInteger(value) || !Number.isFinite(value)) throw new Error('seed must be an integer');
-  return value >>> 0;
-}
-
-function readRequestCount(scenario: unknown, options: SimulationOptions, workers: number, durationMs: number): number {
-  const option = options.requestCount ?? options.totalRequests;
-  const explicit = option ?? findNonNegativeNumber(scenario, [
-    'requestCount',
-    'totalRequests',
-    'attemptedRequests',
-    'simulatedRequests',
-    'workerRequests',
-  ], false);
-  if (explicit !== undefined) {
-    if (!Number.isInteger(explicit)) throw new Error('requestCount must be an integer');
-    return explicit;
-  }
-  const rate = findNonNegativeNumber(scenario, [
-    'requestsPerSecond',
-    'requestRate',
-    'arrivalRate',
-    'rps',
-  ], false);
-  if (rate !== undefined) return Math.max(0, Math.round((rate * durationMs) / 1_000));
-  return workers;
-}
-
-function readProfile(scenario: unknown, options: SimulationOptions): ScenarioProfile {
-  const locks = extractLocks(scenario);
-  const durationMs = readDuration(scenario, options);
-  const workers = readWorkerCount(options);
-  const requestCount = readRequestCount(scenario, options, workers, durationMs);
-  const kind = classifyScenario(scenario, locks);
-  const id = scenarioId(scenario);
-  const name = scenarioName(scenario, id);
-
-  return {
-    id,
-    name,
-    kind,
-    locks,
-    durationMs,
-    requestCount,
-    requestsPerSecond: findNonNegativeNumber(scenario, [
-      'requestsPerSecond',
-      'requestRate',
-      'arrivalRate',
-      'rps',
-    ], false),
-    serviceTimeMs: findNonNegativeNumber(scenario, [
-      'serviceTimeMs',
-      'baseLatencyMs',
-      'latencyMs',
-      'requestLatencyMs',
-    ], false),
-    contentionRate: asRate(findNumber(scenario, [
-      'contentionRate',
-      'contentionProbability',
-      'contention',
-    ], false)),
-    deadlockCount: findNonNegativeNumber(scenario, [
-      'deadlockCount',
-      'deadlocks',
-      'expectedDeadlocks',
-      'cycleCount',
-      'deadlockEvents',
-    ], false),
-    deadlockRate: asRate(findNumber(scenario, [
-      'deadlockRate',
-      'deadlockProbability',
-      'cycleRate',
-    ], false)),
-    droppedRequests: findNonNegativeNumber(scenario, [
-      'droppedRequests',
-      'dropCount',
-      'drops',
-      'expectedDroppedRequests',
-      'failedRequests',
-      'rejectedRequests',
-    ], false),
-    dropRate: asRate(findNumber(scenario, [
-      'dropRate',
-      'dropProbability',
-      'failureRate',
-      'rejectionRate',
-      'errorRate',
-    ], false)),
-    completedRequests: findNonNegativeNumber(scenario, [
-      'completedRequests',
-      'expectedCompletedRequests',
-      'completed',
-      'successfulRequests',
-      'successCount',
-    ], false),
-    p50LatencyMs: findNonNegativeNumber(scenario, [
-      'p50LatencyMs',
-      'latencyP50Ms',
-      'p50Ms',
-      'p50',
-    ], false),
-    p95LatencyMs: findNonNegativeNumber(scenario, [
-      'p95LatencyMs',
-      'latencyP95Ms',
-      'p95Ms',
-      'p95',
-    ], false),
-    p99LatencyMs: findNonNegativeNumber(scenario, [
-      'p99LatencyMs',
-      'latencyP99Ms',
-      'p99Ms',
-      'p99',
-    ], false),
-  };
-}
-
-function readSimulationPhase(scenario: unknown, patched: boolean): SimulationPhaseProfile {
-  return {
-    throughputRps: findNonNegativeNumber(scenario, [
-      'throughputRps',
-      'throughputReqPerSec',
-      'targetThroughputRps',
-      'throughput',
-    ], patched),
-    p50LatencyMs: findNonNegativeNumber(scenario, [
-      'p50LatencyMs',
-      'latencyP50Ms',
-      'p50Ms',
-      'p50',
-    ], patched),
-    p95LatencyMs: findNonNegativeNumber(scenario, [
-      'p95LatencyMs',
-      'latencyP95Ms',
-      'p95Ms',
-      'p95',
-    ], patched),
-    p99LatencyMs: findNonNegativeNumber(scenario, [
-      'p99LatencyMs',
-      'latencyP99Ms',
-      'p99Ms',
-      'p99',
-    ], patched),
-    deadlockRatePerMinute: findNonNegativeNumber(scenario, [
-      'deadlockRatePerMinute',
-      'deadlocksPerMinute',
-      'cyclesPerMinute',
-    ], patched),
-    dropRate: asRate(findNumber(scenario, [
-      'dropRate',
-      'dropProbability',
-      'failureRate',
-      'rejectionRate',
-      'errorRate',
-    ], patched)),
-  };
-}
-
-function patchedFor(options: SimulationOptions): boolean {
-  if (options.patched !== undefined) return options.patched;
-  if (options.patchApplied !== undefined) return options.patchApplied;
-  if (options.patchedMode !== undefined) return options.patchedMode;
-  if (options.patchMode !== undefined) return options.patchMode;
-  return options.mode === 'after' || options.mode === 'patched';
-}
-
-function countForBaseline(value: number | undefined, requests: number): number | undefined {
-  if (value === undefined) return undefined;
-  // Preset metrics are conventionally recorded with the default 500-worker
-  // load. Scale counts for a custom load while preserving the default exactly.
-  return Math.max(0, Math.round(value * (requests / DEFAULT_WORKER_COUNT)));
-}
-
-function deriveContention(profile: ScenarioProfile, requests: number): number {
-  if (profile.contentionRate !== undefined) return profile.contentionRate;
-  if (profile.deadlockRate !== undefined) return clamp(profile.deadlockRate * 4, 0, 1);
-  if (profile.deadlockCount !== undefined && requests > 0) return clamp(profile.deadlockCount / requests * 4, 0, 1);
-  if (profile.kind === 'deadlock') return 0.8;
-  if (profile.kind === 'pool-starvation') return 0.65;
-  if (profile.kind === 'retry-storm') return 0.55;
-  return 0.15;
-}
-
-function deriveDrops(
-  profile: ScenarioProfile,
-  phase: SimulationPhaseProfile,
-  requests: number,
-  patched: boolean,
-): number {
-  if (patched || requests === 0) return 0;
-  const explicitCompleted = countForBaseline(profile.completedRequests, requests);
-  if (explicitCompleted !== undefined) return clamp(requests - explicitCompleted, 0, requests);
-  const explicitDrops = countForBaseline(profile.droppedRequests, requests);
-  if (explicitDrops !== undefined) return clamp(explicitDrops, 0, requests);
-  if (phase.dropRate !== undefined) return Math.min(requests, Math.round(requests * phase.dropRate));
-  if (profile.dropRate !== undefined) return Math.min(requests, Math.round(requests * profile.dropRate));
-  const contention = deriveContention(profile, requests);
-  if (profile.kind === 'deadlock') return Math.min(requests, Math.max(0, Math.round(requests * (0.12 + contention * 0.18))));
-  if (profile.kind === 'pool-starvation') return Math.min(requests, Math.round(requests * (0.2 + contention * 0.3)));
-  if (profile.kind === 'retry-storm') return Math.min(requests, Math.round(requests * (0.25 + contention * 0.25)));
-  return 0;
-}
-
-function deriveDeadlocks(
-  profile: ScenarioProfile,
-  phase: SimulationPhaseProfile,
-  requests: number,
-  durationMs: number,
-  patched: boolean,
-): number {
-  if (patched || requests === 0) return 0;
-  if (profile.deadlockCount !== undefined) {
-    return clamp(countForBaseline(profile.deadlockCount, requests) ?? 0, 0, requests);
-  }
-  if (phase.deadlockRatePerMinute !== undefined) {
-    const expected = Math.round((phase.deadlockRatePerMinute * durationMs) / 60_000);
-    return Math.min(requests, phase.deadlockRatePerMinute > 0 && durationMs > 0 ? Math.max(1, expected) : expected);
-  }
-  if (profile.deadlockRate !== undefined) return Math.min(requests, Math.round(requests * profile.deadlockRate));
-  if (profile.kind !== 'deadlock') return 0;
-  if (requests < 2) return 0;
-  return Math.max(1, Math.round(requests * (0.03 + deriveContention(profile, requests) * 0.08)));
-}
-
-function nextRandom(state: { value: number }): number {
-  // Mulberry32-like integer step; all arithmetic is deterministic in JS.
-  state.value = (state.value + 0x6d2b79f5) >>> 0;
-  let value = state.value;
-  value = Math.imul(value ^ (value >>> 15), value | 1);
-  value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
-  return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
-}
-
-function interpolate(points: readonly [number, number][], rank: number): number {
-  if (rank <= points[0][0]) return points[0][1];
-  for (let index = 1; index < points.length; index += 1) {
-    const right = points[index];
-    const left = points[index - 1];
-    if (rank <= right[0]) {
-      const span = right[0] - left[0];
-      return span === 0 ? right[1] : left[1] + ((rank - left[0]) / span) * (right[1] - left[1]);
-    }
-  }
-  return points[points.length - 1][1];
-}
-
-function generateLatencies(
-  count: number,
-  profile: ScenarioProfile,
-  patched: boolean,
-  seed: number,
-  contention: number,
-  explicit: ExplicitPercentiles,
-): number[] {
-  if (count <= 0) return [];
-  const service = profile.serviceTimeMs ?? 8;
-  const multiplier = patched ? 1 + contention * 0.12 : 1 + contention * 1.4;
-  const base = Math.max(0.1, service * multiplier);
-  const state = { value: seed >>> 0 };
-  const hasExplicit = explicit.p50 !== undefined || explicit.p95 !== undefined || explicit.p99 !== undefined;
-  const p50 = explicit.p50 ?? base * 1.45;
-  const p95 = Math.max(p50, explicit.p95 ?? base * 2.8);
-  const p99 = Math.max(p95, explicit.p99 ?? base * 4.2);
-  const points: readonly [number, number][] = [
-    [0, Math.max(0, base * 0.7)],
-    [0.5, Math.max(0, p50)],
-    [0.95, Math.max(0, p95)],
-    [0.99, Math.max(0, p99)],
-    [1, Math.max(0, p99 * 1.08)],
-  ];
-  const values: number[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const rank = count === 1 ? 0.5 : index / (count - 1);
-    const quantile = interpolate(points, rank);
-    // Keep explicit percentile fixtures exact; generated scenarios receive a
-    // small seeded jitter so different seeds still represent different runs.
-    const jitter = hasExplicit ? 0 : (nextRandom(state) - 0.5) * Math.min(0.25, quantile * 0.025);
-    values.push(Math.max(0, quantile + jitter));
-  }
-  return values.sort((left, right) => left - right);
-}
-
-function simulationRunbook(profile: ScenarioProfile): string {
-  const order = profile.locks.length > 0
-    ? profile.locks.join(' → ')
-    : 'admission-gate → resource-acquisition → work → resource-release → retry-budget';
-  const control = profile.locks.length > 0
-    ? `- [ ] Enforce one canonical lock order: ${order}.`
-    : '- [ ] Bound admission and retries; never hold a scarce resource while sleeping or retrying.';
-  return [
-    '# 3 a.m. Outage Runbook Checklist',
-    '',
-    `Incident: **${profile.name}**`,
-    '- [ ] Declare the incident and capture queue depth, saturation, errors, and latency.',
-    control,
-    '- [ ] Run the before/after deterministic simulation and canary the remediation.',
-    '- [ ] Verify the failure signal is gone, drain work gradually, and preserve evidence.',
-    '- [ ] Roll back the canary if saturation or errors regress.',
-  ].join('\n');
-}
-
-/**
- * Calculate a percentile using the R-7 linear interpolation convention.
- * Empty samples return zero, and the input array is never mutated.
+ * Calculate a percentile using linear interpolation between closest ranks.
+ * `percentile` accepts either a fraction (0..1) or a percentage (0..100).
  */
 export function calculatePercentile(samples: readonly number[], percentile: number): number {
   if (samples.length === 0) return 0;
   if (!Number.isFinite(percentile) || percentile < 0 || percentile > 100) {
-    throw new Error('percentile must be between 0 and 1 (or 0 and 100)');
+    throw new RangeError('percentile must be between 0 and 1 (or 0 and 100)');
   }
   const fraction = percentile > 1 ? percentile / 100 : percentile;
   const sorted = [...samples].sort((left, right) => left - right);
-  if (sorted.length === 1) return sorted[0];
   const position = fraction * (sorted.length - 1);
   const lower = Math.floor(position);
   const upper = Math.ceil(position);
-  if (lower === upper) return sorted[lower];
   return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
 }
 
-export const percentile = calculatePercentile;
-export const calculateLatencyPercentile = calculatePercentile;
-
-function metricPercentile(samples: readonly number[], explicit: number | undefined, percentileValue: number): number {
-  return explicit === undefined ? calculatePercentile(samples, percentileValue) : explicit;
-}
-
-/** Run a deterministic virtual-time simulation of one incident scenario. */
-export function simulateScenario(
-  scenario: ScenarioInput | unknown,
-  options: SimulationOptions = {},
-): SimulationResult {
-  const patched = patchedFor(options);
-  const profile = readProfile(scenario, options);
-  const phase = readSimulationPhase(scenario, patched);
-  const workerCount = readWorkerCount(options);
-  const requestCount = profile.requestCount ?? workerCount;
-  const deadlockCount = deriveDeadlocks(profile, phase, requestCount, profile.durationMs, patched);
-  const droppedRequests = deriveDrops(profile, phase, requestCount, patched);
-  const completedRequests = patched
-    ? requestCount
-    : Math.max(0, Math.min(requestCount, requestCount - droppedRequests));
-  const contentionRate = deriveContention(profile, requestCount);
-  const seed = readSeed(scenario, options);
-  const explicit: ExplicitPercentiles = {
-    p50: phase.p50LatencyMs ?? (patched
-      ? findNonNegativeNumber(scenario, ['patchedP50LatencyMs', 'afterP50LatencyMs'], true)
-      : profile.p50LatencyMs),
-    p95: phase.p95LatencyMs ?? (patched
-      ? findNonNegativeNumber(scenario, ['patchedP95LatencyMs', 'afterP95LatencyMs'], true)
-      : profile.p95LatencyMs),
-    p99: phase.p99LatencyMs ?? (patched
-      ? findNonNegativeNumber(scenario, ['patchedP99LatencyMs', 'afterP99LatencyMs'], true)
-      : profile.p99LatencyMs),
-  };
-  const latenciesMs = generateLatencies(completedRequests, profile, patched, seed, contentionRate, explicit);
-  const p50 = metricPercentile(latenciesMs, explicit.p50, 0.5);
-  const p95 = metricPercentile(latenciesMs, explicit.p95, 0.95);
-  const p99 = metricPercentile(latenciesMs, explicit.p99, 0.99);
-  const derivedThroughput = profile.durationMs === 0
-    ? 0
-    : completedRequests / (profile.durationMs / 1_000);
-  // Presets record measured successful throughput for each phase. Preserve
-  // that target at the default 500-worker load and scale it predictably for a
-  // custom worker count; fixtures without targets use the request calculation.
-  const throughputTarget = phase.throughputRps === undefined
-    ? undefined
-    : phase.throughputRps * (workerCount / DEFAULT_WORKER_COUNT);
-  const throughput = throughputTarget ?? derivedThroughput;
-  const healthyTarget = patched
-    ? throughput
-    : (findNestedRecordValue(
-        scenario,
-        ['healthy', 'fullCapacity', 'capacity'],
-        ['throughputRps', 'throughputReqPerSec', 'throughput'],
-      ) ?? throughput);
-  const runbook = simulationRunbook(profile);
-  const mode: PatchMode = patched ? 'after' : 'before';
-
-  return {
-    scenarioId: profile.id,
-    scenarioName: profile.name,
-    mode,
-    patchMode: mode,
-    patched,
-    patchApplied: patched,
-    beforeAfterPatch: mode,
-    state: patched ? 'patched' : 'unpatched',
-    workerCount,
-    workers: workerCount,
-    durationMs: profile.durationMs,
-    requestedRequests: requestCount,
-    requests: requestCount,
-    requestCount,
-    totalRequests: requestCount,
-    completedRequests,
-    completed: completedRequests,
-    droppedRequests: requestCount - completedRequests,
-    dropped: requestCount - completedRequests,
-    deadlockCount,
-    deadlocks: deadlockCount,
-    throughputReqPerSec: throughput,
-    throughputRps: throughput,
-    throughput,
-    healthyThroughput: healthyTarget,
-    fullThroughput: healthyTarget,
-    capacityThroughput: healthyTarget,
-    maxThroughput: healthyTarget,
-    p50LatencyMs: p50,
-    p95LatencyMs: p95,
-    p99LatencyMs: p99,
-    p50Latency: p50,
-    p95Latency: p95,
-    p99Latency: p99,
-    p50,
-    p95,
-    p99,
-    latenciesMs,
-    latencyMs: [...latenciesMs],
-    contentionRate,
-    seed,
-    runbook,
-    runbookMarkdown: runbook,
-  };
-}
-
-export const simulate = simulateScenario;
-export const runSimulation = simulateScenario;
-
-function hashStringSeed(input: string): number {
+/** Stable 32-bit FNV-1a hash used to derive a default seed from the trace contents. */
+export function hashTraceSeed(events: readonly LockEvent[]): number {
   let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
+  for (const event of events) {
+    const token = `${event.workerId}|${event.action}|${event.resourceId};`;
+    for (let index = 0; index < token.length; index += 1) {
+      hash ^= token.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
   }
   return hash >>> 0;
 }
 
-/**
- * Deterministic seed-based 500-worker chaos benchmark simulator.
- * Computes realistic Before Patch vs. After Canonical Patch metrics.
- */
-export function runChaosBenchmark(
-  eventsOrScenario: readonly LockEvent[] | ScenarioInput | unknown = [],
-  workers: number = DEFAULT_WORKER_COUNT,
-): ChaosBenchmarkResult & {
-  readonly workerCount: number;
-  readonly workers: number;
-} {
-  const effectiveWorkers = Number.isFinite(workers) && workers > 0 ? Math.round(workers) : DEFAULT_WORKER_COUNT;
-  const events: readonly LockEvent[] = Array.isArray(eventsOrScenario)
-    ? (eventsOrScenario as readonly LockEvent[])
-    : isRecord(eventsOrScenario) && Array.isArray(eventsOrScenario.events)
-      ? (eventsOrScenario.events as readonly LockEvent[])
-      : [];
+function createRandom(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let value = state;
+    value = Math.imul(value ^ (value >>> 15), value | 1);
+    value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
+    return ((value ^ (value >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
 
-  const seedSource =
-    events.length > 0
-      ? events.map((e) => `${e.workerId}:${e.action}:${e.resourceId}:${e.line}`).join('|')
-      : isRecord(eventsOrScenario) && typeof eventsOrScenario.id === 'string'
-        ? eventsOrScenario.id
-        : 'default-chaos-seed';
+/** Derive one program per trace worker, ordered by timestamp (ties keep trace order). */
+export function deriveWorkerPrograms(events: readonly LockEvent[]): Map<string, Program> {
+  const ordered = events
+    .map((event, index) => ({ event, index }))
+    .sort((left, right) => left.event.timestamp - right.event.timestamp || left.index - right.index);
+  const programs = new Map<string, Step[]>();
+  const lockedByWorker = new Map<string, Set<string>>();
 
-  const seed = hashStringSeed(seedSource);
-  const deadlocks = events.length > 0 ? detectDeadlocks(events) : [];
-  const races = events.length > 0 ? detectRaces(events) : [];
-  const starvations = events.length > 0 ? detectStarvation(events) : [];
+  for (const { event } of ordered) {
+    const program = programs.get(event.workerId) ?? [];
+    const locked = lockedByWorker.get(event.workerId) ?? new Set<string>();
+    if (event.action === 'ACQUIRE' || event.action === 'WAIT') {
+      if (!locked.has(event.resourceId)) {
+        program.push({ kind: 'lock', resource: event.resourceId });
+        locked.add(event.resourceId);
+      }
+    } else if (event.action === 'READ' || event.action === 'WRITE') {
+      program.push({ kind: 'access', resource: event.resourceId, write: event.action === 'WRITE' });
+    }
+    programs.set(event.workerId, program);
+    lockedByWorker.set(event.workerId, locked);
+  }
 
-  const scale = effectiveWorkers / DEFAULT_WORKER_COUNT;
-  const hasDeadlockOrStarvation = deadlocks.length > 0 || starvations.length > 0 || events.length === 0;
-  const hasRaces = races.length > 0;
+  for (const [workerId, program] of programs) {
+    if (program.length === 0) programs.delete(workerId);
+  }
+  return programs;
+}
 
-  const baseDeadlocks = hasDeadlockOrStarvation ? 42 + (seed % 96) : 0;
-  const baseRaces = hasRaces ? 38 + ((seed >>> 4) % 110) : 0;
-  const deadlocksTriggered = Math.max(hasDeadlockOrStarvation ? 34 : 0, Math.round(baseDeadlocks * scale));
-  const raceConditionsTriggered = Math.max(hasRaces ? 34 : 0, Math.round(baseRaces * scale));
+function compareResources(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
 
-  const beforeThroughput = 95 + (seed % 130); // 95..224 req/sec
-  const beforeP50 = 460 + (seed % 320);
-  const beforeP95 = 2950 + (seed % 850);
-  const beforeP99 = 4250 + (seed % 700); // 4250..4949 ms
-  const beforeSuccessRate = 21 + (seed % 19); // 21..39 %
+/** The canonical order: every lock resource, plus every resource accessed without a lock. */
+export function canonicalLockOrderFor(programs: ReadonlyMap<string, Program>): string[] {
+  const resources = new Set<string>();
+  for (const program of programs.values()) {
+    for (const step of program) resources.add(step.resource);
+  }
+  return [...resources].sort(compareResources);
+}
 
-  const afterThroughput = 4720 + (seed % 620); // 4720..5339 req/sec
-  const afterP50 = 4;
-  const afterP95 = 11;
-  const afterP99 = 18;
-  const afterSuccessRate = 100;
+/** Apply the recommended remediation: sorted lock acquisition plus guard locks for accesses. */
+export function patchProgram(program: Program): Program {
+  const locks = new Set<string>();
+  const accesses: Step[] = [];
+  for (const step of program) {
+    locks.add(step.resource);
+    if (step.kind === 'access') accesses.push(step);
+  }
+  const sortedLocks: Step[] = [...locks]
+    .sort(compareResources)
+    .map((resource) => ({ kind: 'lock', resource }));
+  return [...sortedLocks, ...accesses];
+}
 
-  const before: SimulationMetrics = {
-    workers: effectiveWorkers,
-    deadlocksTriggered,
-    raceConditionsTriggered,
-    throughputReqPerSec: beforeThroughput,
-    p50Ms: beforeP50,
-    p95Ms: beforeP95,
-    p99Ms: beforeP99,
-    successRatePct: beforeSuccessRate,
+interface VirtualWorker {
+  readonly program: Program;
+  stepIndex: number;
+  held: Set<string>;
+  waitingOn: string | null;
+  waitStart: number;
+  /** Whether this wait has already run its one deadlock check (as in PostgreSQL's deadlock_timeout). */
+  deadlockChecked: boolean;
+  requestStart: number;
+  requestsStarted: number;
+  workRemaining: number;
+  corrupted: boolean;
+  serial: number;
+  touched: Set<string>;
+  done: boolean;
+}
+
+interface UnprotectedAccess {
+  readonly serial: number;
+  readonly write: boolean;
+}
+
+function runSimulation(templates: readonly Program[], config: SimulationConfig): SimulationMetrics {
+  const random = createRandom(config.seed);
+  const workers: VirtualWorker[] = Array.from({ length: config.workers }, (_, index) => ({
+    program: templates[index % templates.length],
+    stepIndex: 0,
+    held: new Set<string>(),
+    waitingOn: null,
+    waitStart: 0,
+    deadlockChecked: false,
+    requestStart: 0,
+    requestsStarted: 1,
+    workRemaining: -1,
+    corrupted: false,
+    serial: 0,
+    touched: new Set<string>(),
+    done: false,
+  }));
+  const holders = new Map<string, number>();
+  const unprotected = new Map<string, Map<number, UnprotectedAccess>>();
+  const latencies: number[] = [];
+  const order = workers.map((_, index) => index);
+
+  let completed = 0;
+  let deadlocks = 0;
+  let races = 0;
+  let timeouts = 0;
+  let aborted = 0;
+  let corruptedFailures = 0;
+  let finishedWorkers = 0;
+  let tick = 0;
+  let workerSteps = 0;
+  let truncated = false;
+
+  const releaseAll = (index: number): void => {
+    const worker = workers[index];
+    for (const resource of worker.held) {
+      if (holders.get(resource) === index) holders.delete(resource);
+    }
+    worker.held.clear();
+    for (const resource of worker.touched) unprotected.get(resource)?.delete(index);
+    worker.touched.clear();
   };
 
-  const after: SimulationMetrics = {
-    workers: effectiveWorkers,
-    deadlocksTriggered: 0,
-    raceConditionsTriggered: 0,
-    throughputReqPerSec: afterThroughput,
-    p50Ms: afterP50,
-    p95Ms: afterP95,
-    p99Ms: afterP99,
-    successRatePct: afterSuccessRate,
+  const startNextRequest = (index: number, now: number): void => {
+    const worker = workers[index];
+    worker.stepIndex = 0;
+    worker.waitingOn = null;
+    worker.workRemaining = -1;
+    worker.corrupted = false;
+    worker.serial += 1;
+    if (worker.requestsStarted >= config.requestsPerWorker) {
+      worker.done = true;
+      finishedWorkers += 1;
+      return;
+    }
+    worker.requestsStarted += 1;
+    worker.requestStart = now + 1;
   };
 
-  const improvementFactor = Number((after.throughputReqPerSec / before.throughputReqPerSec).toFixed(2));
+  const finishRequest = (index: number, now: number): void => {
+    const worker = workers[index];
+    if (worker.corrupted) corruptedFailures += 1;
+    else {
+      completed += 1;
+      latencies.push(now - worker.requestStart + 1);
+    }
+    releaseAll(index);
+    startNextRequest(index, now);
+  };
 
+  const abortRequest = (index: number, now: number): void => {
+    aborted += 1;
+    releaseAll(index);
+    startNextRequest(index, now);
+  };
+
+  const recordAccess = (index: number, resource: string, write: boolean): void => {
+    const worker = workers[index];
+    if (worker.held.has(resource)) return;
+    const accessors = unprotected.get(resource) ?? new Map<number, UnprotectedAccess>();
+    let conflicted = false;
+    for (const [other, access] of accessors) {
+      if (other === index || workers[other].serial !== access.serial) continue;
+      if (write || access.write) {
+        conflicted = true;
+        workers[other].corrupted = true;
+      }
+    }
+    if (conflicted) {
+      races += 1;
+      worker.corrupted = true;
+    }
+    const previous = accessors.get(index);
+    accessors.set(index, { serial: worker.serial, write: write || (previous?.write ?? false) });
+    unprotected.set(resource, accessors);
+    worker.touched.add(resource);
+  };
+
+  /**
+   * Follow the wait-for chain from a worker whose wait just reached the detection delay.
+   * Each blocked worker waits on exactly one holder, so the chain either ends or loops.
+   * If the starting worker is on a cycle, abort one victim (the highest index) to break it.
+   */
+  const checkForDeadlock = (start: number, now: number): void => {
+    const visited = new Set<number>();
+    let current: number | undefined = start;
+    while (current !== undefined && !visited.has(current)) {
+      visited.add(current);
+      const waitingOn: string | null = workers[current].waitingOn;
+      current = waitingOn === null ? undefined : holders.get(waitingOn);
+    }
+    if (current !== start) return;
+    const cycle: number[] = [];
+    let member = start;
+    do {
+      cycle.push(member);
+      member = holders.get(workers[member].waitingOn as string) as number;
+    } while (member !== start);
+    deadlocks += 1;
+    abortRequest(Math.max(...cycle), now);
+  };
+
+  while (finishedWorkers < workers.length && tick < config.maxVirtualMs) {
+    workerSteps += workers.length;
+    if (workerSteps > SIMULATION_LIMITS.maxWorkerSteps) {
+      truncated = true;
+      break;
+    }
+    for (let index = order.length - 1; index > 0; index -= 1) {
+      const swap = Math.floor(random() * (index + 1));
+      [order[index], order[swap]] = [order[swap], order[index]];
+    }
+
+    let progressed = false;
+    const dueForCheck: number[] = [];
+
+    for (const index of order) {
+      const worker = workers[index];
+      if (worker.done || worker.requestStart > tick) continue;
+
+      if (worker.workRemaining > 0) {
+        worker.workRemaining -= 1;
+        progressed = true;
+        if (worker.workRemaining === 0) finishRequest(index, tick);
+        continue;
+      }
+
+      const step = worker.program[worker.stepIndex];
+      if (step === undefined) {
+        progressed = true;
+        if (config.workMs <= 1) finishRequest(index, tick);
+        else worker.workRemaining = config.workMs - 1;
+        continue;
+      }
+
+      if (step.kind === 'access') {
+        recordAccess(index, step.resource, step.write);
+        worker.stepIndex += 1;
+        progressed = true;
+        continue;
+      }
+
+      const holder = holders.get(step.resource);
+      if (holder === undefined || holder === index) {
+        holders.set(step.resource, index);
+        worker.held.add(step.resource);
+        worker.waitingOn = null;
+        worker.stepIndex += 1;
+        progressed = true;
+        continue;
+      }
+
+      if (worker.waitingOn !== step.resource) {
+        worker.waitingOn = step.resource;
+        worker.waitStart = tick;
+        worker.deadlockChecked = false;
+      }
+      const waited = tick - worker.waitStart;
+      if (waited >= config.lockTimeoutMs) {
+        timeouts += 1;
+        abortRequest(index, tick);
+        progressed = true;
+      } else if (waited >= config.deadlockDetectionMs && !worker.deadlockChecked) {
+        worker.deadlockChecked = true;
+        dueForCheck.push(index);
+      }
+    }
+
+    for (const index of dueForCheck) {
+      // A previous check this tick may already have aborted this worker's request.
+      if (workers[index].waitingOn !== null) checkForDeadlock(index, tick);
+    }
+
+    if (!progressed && dueForCheck.length === 0) {
+      // Every runnable worker is blocked: jump straight to the next timeout or detection point.
+      let next = config.maxVirtualMs;
+      for (const worker of workers) {
+        if (worker.done) continue;
+        if (worker.requestStart > tick) next = Math.min(next, worker.requestStart);
+        else if (worker.waitingOn !== null) {
+          next = Math.min(
+            next,
+            worker.deadlockChecked
+              ? worker.waitStart + config.lockTimeoutMs
+              : worker.waitStart + config.deadlockDetectionMs,
+          );
+        }
+      }
+      tick = Math.max(tick + 1, next);
+      continue;
+    }
+    tick += 1;
+  }
+
+  const totalRequests = config.workers * config.requestsPerWorker;
+  const unfinished = totalRequests - completed - corruptedFailures - aborted;
+  const durationMs = Math.max(1, tick);
+  if (tick >= config.maxVirtualMs && unfinished > 0) truncated = true;
   return {
-    workerCount: effectiveWorkers,
-    workers: effectiveWorkers,
+    truncated,
+    workers: config.workers,
+    totalRequests,
+    completedRequests: completed,
+    failedRequests: totalRequests - completed,
+    deadlocksTriggered: deadlocks,
+    raceConditionsTriggered: races,
+    lockTimeouts: timeouts,
+    unfinishedRequests: unfinished,
+    throughputReqPerSec: Math.round((completed / durationMs) * 100_000) / 100,
+    p50Ms: Math.round(calculatePercentile(latencies, 0.5)),
+    p95Ms: Math.round(calculatePercentile(latencies, 0.95)),
+    p99Ms: Math.round(calculatePercentile(latencies, 0.99)),
+    successRatePct: Math.round((completed / totalRequests) * 1_000) / 10,
+    virtualDurationMs: tick,
+  };
+}
+
+function boundedInteger(value: number | undefined, fallback: number, min: number, max: number, name: string): number {
+  if (value === undefined) return fallback;
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new SimulationInputError(`${name} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+export function resolveSimulationConfig(events: readonly LockEvent[], options: SimulationOptions = {}): SimulationConfig {
+  const maxVirtualMs = boundedInteger(options.maxVirtualMs, SIMULATION_DEFAULTS.maxVirtualMs, 100, SIMULATION_LIMITS.maxVirtualMs, 'maxVirtualMs');
+  return {
+    workers: boundedInteger(options.workers, DEFAULT_WORKER_COUNT, 1, SIMULATION_LIMITS.maxWorkers, 'workers'),
+    requestsPerWorker: boundedInteger(options.requestsPerWorker, SIMULATION_DEFAULTS.requestsPerWorker, 1, SIMULATION_LIMITS.maxRequestsPerWorker, 'requestsPerWorker'),
+    seed: boundedInteger(options.seed, hashTraceSeed(events), 0, 0xffffffff, 'seed'),
+    lockTimeoutMs: boundedInteger(options.lockTimeoutMs, SIMULATION_DEFAULTS.lockTimeoutMs, 1, maxVirtualMs, 'lockTimeoutMs'),
+    deadlockDetectionMs: boundedInteger(options.deadlockDetectionMs, SIMULATION_DEFAULTS.deadlockDetectionMs, 1, maxVirtualMs, 'deadlockDetectionMs'),
+    workMs: boundedInteger(options.workMs, SIMULATION_DEFAULTS.workMs, 1, 1_000, 'workMs'),
+    maxVirtualMs,
+  };
+}
+
+/**
+ * Replay a trace's lock programs across many virtual workers, once as recorded and once
+ * with the canonical lock-order remediation applied, and report measured metrics.
+ */
+export function runChaosBenchmark(events: readonly LockEvent[], options: SimulationOptions = {}): ChaosBenchmarkResult {
+  const programs = deriveWorkerPrograms(events);
+  if (programs.size === 0) {
+    throw new SimulationInputError(
+      'Trace contains no ACQUIRE, WAIT, READ, or WRITE steps to simulate.',
+    );
+  }
+  const config = resolveSimulationConfig(events, options);
+  const templates = [...programs.keys()].sort(compareResources).map((workerId) => programs.get(workerId)!);
+  const before = runSimulation(templates, config);
+  const after = runSimulation(templates.map(patchProgram), config);
+  return {
+    config,
+    canonicalLockOrder: canonicalLockOrderFor(programs),
     before,
     after,
-    improvementFactor,
+    improvementFactor:
+      before.completedRequests > 0
+        ? Math.round(
+            ((after.completedRequests / Math.max(1, after.virtualDurationMs)) /
+              (before.completedRequests / Math.max(1, before.virtualDurationMs))) *
+              100,
+          ) / 100
+        : null,
   };
 }

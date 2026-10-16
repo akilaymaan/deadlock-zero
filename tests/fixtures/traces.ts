@@ -267,37 +267,3 @@ export const POOL_STARVATION_TRACE: LockEvent[] = [
     codeSnippet: 'const conn = await pool.acquire("pg_tx_pool");',
   },
 ];
-
-export const SIMULATOR_FIXTURE_SCENARIO = {
-  id: 'payment-ledger-ab-ba-lock-deadlock',
-  title: 'Payment Ledger AB-BA Lock Deadlock',
-  category: 'deadlock',
-  simulation: {
-    seed: 4101,
-    durationSeconds: 60,
-    workerCount: 500,
-    healthy: {
-      throughputRps: 9200,
-      p50LatencyMs: 31,
-      p95LatencyMs: 88,
-    },
-    beforePatch: {
-      throughputRps: 2850,
-      p50LatencyMs: 265,
-      p95LatencyMs: 5100,
-      deadlockRatePerMinute: 15,
-      dropRate: 0.23,
-    },
-    afterPatch: {
-      throughputRps: 9200,
-      p50LatencyMs: 34,
-      p95LatencyMs: 96,
-      deadlockRatePerMinute: 0,
-      dropRate: 0,
-    },
-  },
-  contention: {
-    mode: 'ordered-locks',
-    resourceOrder: ['ledger-entry', 'account-balance'],
-  },
-};

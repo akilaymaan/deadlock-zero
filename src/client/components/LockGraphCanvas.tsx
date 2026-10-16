@@ -1,21 +1,11 @@
 import React, { useMemo, useState } from 'react';
 import { Maximize2, Network, ZoomIn, ZoomOut } from 'lucide-react';
-import type {
-  DeadlockCycle,
-  GraphEdge,
-  GraphNode,
-  LockEvent,
-  RaceConflict,
-  StarvationAlert,
-} from '../../shared/types';
+import type { DeadlockCycle, GraphEdge, GraphNode } from '../../shared/types';
 
 interface LockGraphCanvasProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
-  events?: LockEvent[];
   cycles: DeadlockCycle[];
-  races: RaceConflict[];
-  starvation: StarvationAlert[];
   selectedNodeId: string | null;
   onSelectNode: (id: string | null) => void;
 }
@@ -310,10 +300,22 @@ export const LockGraphCanvas: React.FC<LockGraphCanvasProps> = ({
                 <g
                   key={node.id}
                   transform={`translate(${node.x}, ${node.y})`}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={isSelected}
+                  aria-label={`${node.type === 'WORKER' ? 'Worker' : 'Lock'} ${node.label}${node.inCycle ? ', part of a deadlock cycle' : ''}`}
                   onClick={() => onSelectNode(isSelected ? null : node.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                      event.preventDefault();
+                      onSelectNode(isSelected ? null : node.id);
+                    }
+                  }}
+                  onFocus={() => setHoveredNodeId(node.id)}
+                  onBlur={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
                   onMouseEnter={() => setHoveredNodeId(node.id)}
                   onMouseLeave={() => setHoveredNodeId((prev) => (prev === node.id ? null : prev))}
-                  className="cursor-pointer transition-opacity duration-200"
+                  className="cursor-pointer transition-opacity duration-200 focus:outline-none"
                 >
                   {node.inCycle &&
                     (node.type === 'WORKER' ? (

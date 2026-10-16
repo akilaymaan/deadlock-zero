@@ -319,8 +319,12 @@ export function buildWaitForGraph(events: readonly LockEvent[]): WaitForGraphBui
   const resourceSet = new Set<string>();
   const currentHolderByResource = new Map<string, LockEvent>();
   const activeWaits: LockEvent[] = [];
+  const chronological = events
+    .map((event, index) => ({ event, index }))
+    .sort((left, right) => left.event.timestamp - right.event.timestamp || left.index - right.index)
+    .map(({ event }) => event);
 
-  for (const event of events) {
+  for (const event of chronological) {
     if (event.workerId) workerSet.add(event.workerId);
     if (event.resourceId && (event.action === 'ACQUIRE' || event.action === 'WAIT' || event.action === 'RELEASE')) {
       resourceSet.add(event.resourceId);

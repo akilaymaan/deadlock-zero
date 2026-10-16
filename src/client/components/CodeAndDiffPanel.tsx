@@ -1,266 +1,177 @@
 import React, { useEffect, useState } from 'react';
-import {
-  Check,
-  ChevronDown,
-  ChevronUp,
-  ClipboardCheck,
-  Code2,
-  Copy,
-  ListChecks,
-  Sparkles,
-} from 'lucide-react';
-import type { DeadlockCycle, LockEvent, RaceConflict, RemediationPlan } from '../../shared/types';
+import { Check, ChevronDown, ChevronUp, ClipboardCheck, Code2, Copy, ListChecks, TriangleAlert } from 'lucide-react';
+import type { RemediationPlan } from '../../shared/types';
+import { useCopy, type CopyState } from '../lib/clipboard';
 
 interface CodeAndDiffPanelProps {
-  events: LockEvent[];
-  cycles: DeadlockCycle[];
-  races: RaceConflict[];
   remediation: RemediationPlan;
 }
 
-export const CodeAndDiffPanel: React.FC<CodeAndDiffPanelProps> = ({
-  events,
-  cycles,
-  races,
-  remediation,
-}) => {
-  const [checkedItems, setCheckedItems] = useState<Record<number, boolean>>({});
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
-  const [showRawDiff, setShowRawDiff] = useState(false);
+const STRATEGY_TITLES: Record<RemediationPlan['strategy'], string> = {
+  'canonical-lock-order': 'Acquire locks in one canonical order',
+  'guard-shared-state': 'Guard shared state with a lock or compare-and-swap',
+  'shorten-lock-hold-time': 'Shorten how long the contended resource is held',
+  'none-required': 'No fix required for this trace',
+};
+
+function CopyButton({ state, label, onClick, primary = false }: { state: CopyState | undefined; label: string; onClick: () => void; primary?: boolean }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`h-10 inline-flex items-center gap-2 px-4 rounded-xl text-xs font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] cursor-pointer ${
+        primary ? 'bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100'
+      }`}
+    >
+      {state === 'copied' ? <Check className="w-4 h-4" aria-hidden="true" /> : state === 'failed' ? <TriangleAlert className="w-4 h-4" aria-hidden="true" /> : primary ? <Copy className="w-4 h-4" aria-hidden="true" /> : <ClipboardCheck className="w-4 h-4" aria-hidden="true" />}
+      <span aria-live="polite">{state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed: select the text manually' : label}</span>
+    </button>
+  );
+}
+
+function CodeBlock({ code, tone }: { code: string; tone: 'before' | 'after' }) {
+  return (
+    <div className={`rounded-xl border bg-slate-950 p-4 overflow-x-auto ${tone === 'before' ? 'border-rose-500/30' : 'border-emerald-500/30'}`}>
+      <pre className={`font-mono tabular-nums text-xs leading-relaxed ${tone === 'before' ? 'text-rose-200/90' : 'text-emerald-200/95'}`}>
+        {code.split(/\r?\n/).map((line, index) => (
+          <div key={index} className="flex gap-4">
+            <span className="text-slate-600 select-none w-6 text-right shrink-0">{index + 1}</span>
+            <span className="whitespace-pre">{line}</span>
+          </div>
+        ))}
+      </pre>
+    </div>
+  );
+}
+
+export const CodeAndDiffPanel: React.FC<CodeAndDiffPanelProps> = ({ remediation }) => {
+  const [checked, setChecked] = useState<Record<number, boolean>>({});
+  const [showDiff, setShowDiff] = useState(false);
+  const { state: copyState, copy } = useCopy();
 
   useEffect(() => {
-    setCheckedItems({});
-  }, [events, remediation.unifiedDiff]);
+    setChecked({});
+  }, [remediation.runbookMarkdown]);
 
-  const copyText = async (key: string, text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // Fallback for headless/offline test environments
-    }
-    setCopiedKey(key);
-    setTimeout(() => setCopiedKey((prev) => (prev === key ? null : prev)), 2000);
-  };
-
-  const runbookLines = remediation.runbookMarkdown.split(/\r?\n/);
-  const checklistSteps = runbookLines
+  const steps = remediation.runbookMarkdown
+    .split(/\r?\n/)
     .map((line, index) => ({ line, index }))
-    .filter((item) => item.line.startsWith('- [ ] '));
-  const completedCount = Object.values(checkedItems).filter(Boolean).length;
-
-  const whyFixWorksText =
-    cycles.length > 0
-      ? 'Why this fix works: Sorting lock IDs into a single canonical order ensures every worker acquires locks in the exact same sequence, making circular wait deadlocks mathematically impossible.'
-      : races.length > 0
-        ? 'Why this fix works: Wrapping concurrent read-modify-write operations in a scoped mutex or atomic version check prevents two workers from overwriting each other.'
-        : 'Why this fix works: Acquiring locks in a consistent, bounded hierarchy keeps the execution graph cycle-free under high concurrency.';
+    .filter(({ line }) => line.startsWith('- [ ] '));
+  const done = steps.filter(({ index }) => checked[index]).length;
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
-      {/* Left Card: Automated Code Fix (Before vs. After) */}
-      <section className="bg-slate-900/50 border border-slate-800/60 rounded-2xl p-6 lg:p-8 space-y-6 shadow-xl">
+      <section aria-labelledby="fix-title" className="bg-slate-900/50 border border-slate-800/60 rounded-2xl p-6 lg:p-8 space-y-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="space-y-1.5">
-            <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold uppercase tracking-wider">
-              <Code2 className="w-4 h-4" />
-              Automated Code Fix (Before vs. After)
-            </div>
-            <h2 className="text-lg font-bold text-slate-100">
-              Enforce Canonical Lock Ordering
-            </h2>
+            <p className="flex items-center gap-2 text-emerald-400 text-xs font-bold uppercase tracking-wider">
+              <Code2 className="w-4 h-4" aria-hidden="true" />
+              Suggested code fix
+            </p>
+            <h2 id="fix-title" className="text-lg font-bold text-slate-100">{STRATEGY_TITLES[remediation.strategy]}</h2>
           </div>
-
-          <button
-            type="button"
-            onClick={() => copyText('patched', remediation.patchedCode)}
-            className="h-10 flex items-center gap-2 px-4 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs shadow-md transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 active:scale-[0.98] cursor-pointer"
-          >
-            {copiedKey === 'patched' ? (
-              <>
-                <Check className="w-4 h-4" />
-                Copied Fixed Code!
-              </>
-            ) : (
-              <>
-                <Copy className="w-4 h-4" />
-                Copy Fixed Code
-              </>
-            )}
-          </button>
+          <CopyButton primary state={copyState.patched} label="Copy suggested code" onClick={() => void copy('patched', remediation.patchedCode)} />
         </div>
 
-        {/* Plain-English 1-Sentence Explanation */}
-        <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-sm text-slate-200 leading-relaxed">
-          {whyFixWorksText}
-        </div>
+        <p className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-sm text-slate-200 leading-relaxed">
+          {remediation.rationale}
+        </p>
+        <p className="text-xs text-amber-300/90">
+          Generated from your trace. It shows the lock order to adopt; adapt it to your codebase and review it before applying.
+        </p>
 
-        {/* Before (Broken Code) */}
         <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-semibold uppercase tracking-wider text-rose-400">
-              Before — Broken Code (Causes Lockup)
-            </span>
-          </div>
-          <div className="rounded-xl border border-rose-500/30 bg-slate-950 p-4 overflow-x-auto">
-            <pre className="font-mono tabular-nums text-xs leading-relaxed text-rose-200/90 space-y-1">
-              {remediation.brokenCode.split(/\r?\n/).map((line, idx) => (
-                <div key={idx} className="flex gap-4">
-                  <span className="text-slate-600 select-none w-5 text-right shrink-0">
-                    {idx + 1}
-                  </span>
-                  <span className="whitespace-pre">{line}</span>
-                </div>
-              ))}
-            </pre>
-          </div>
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-rose-400">Before: code implicated by the trace</h3>
+          <CodeBlock code={remediation.brokenCode} tone="before" />
         </div>
-
-        {/* After (Patched Canonical Code) */}
         <div className="space-y-2">
-          <div className="flex items-center justify-between">
-            <span className="flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-emerald-400">
-              <Sparkles className="w-3.5 h-3.5" />
-              After — Recommended Fix (Deadlock-Free)
-            </span>
-          </div>
-          <div className="rounded-xl border border-emerald-500/30 bg-slate-950 p-4 overflow-x-auto">
-            <pre className="font-mono tabular-nums text-xs leading-relaxed text-emerald-200/95 space-y-1">
-              {remediation.patchedCode.split(/\r?\n/).map((line, idx) => (
-                <div key={idx} className="flex gap-4">
-                  <span className="text-slate-600 select-none w-5 text-right shrink-0">
-                    {idx + 1}
-                  </span>
-                  <span className="whitespace-pre">{line}</span>
-                </div>
-              ))}
-            </pre>
-          </div>
+          <h3 className="text-xs font-semibold uppercase tracking-wider text-emerald-400">After: suggested pattern</h3>
+          <CodeBlock code={remediation.patchedCode} tone="after" />
         </div>
 
-        {/* Progressive Disclosure: Optional Unified Git Diff */}
         <div className="pt-2 border-t border-slate-800/60">
           <button
             type="button"
-            onClick={() => setShowRawDiff((prev) => !prev)}
-            className="flex items-center gap-2 text-xs font-semibold text-slate-400 hover:text-slate-200 transition-colors cursor-pointer"
+            aria-expanded={showDiff}
+            onClick={() => setShowDiff((value) => !value)}
+            className="flex items-center gap-2 text-xs font-semibold text-slate-400 hover:text-slate-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 rounded cursor-pointer"
           >
-            {showRawDiff ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-            {showRawDiff ? 'Hide Unified Git Diff' : 'Show Unified Git Diff Patch'}
+            {showDiff ? <ChevronUp className="w-4 h-4" aria-hidden="true" /> : <ChevronDown className="w-4 h-4" aria-hidden="true" />}
+            {showDiff ? 'Hide unified diff' : 'Show unified diff'}
           </button>
-
-          {showRawDiff && (
-            <div className="mt-3 rounded-xl border border-slate-800/80 bg-slate-950 p-4 overflow-x-auto">
-              <pre className="font-mono tabular-nums text-xs leading-relaxed space-y-0.5">
-                {remediation.unifiedDiff.split(/\r?\n/).map((line, i) => {
-                  const color = line.startsWith('+')
-                    ? 'text-emerald-400 bg-emerald-500/10'
-                    : line.startsWith('-')
-                      ? 'text-rose-400 bg-rose-500/10'
-                      : line.startsWith('@@')
-                        ? 'text-cyan-400'
-                        : 'text-slate-300';
-                  return (
-                    <div key={i} className={`px-2 py-0.5 rounded-xs whitespace-pre ${color}`}>
-                      {line}
-                    </div>
-                  );
-                })}
+          {showDiff && (
+            <div className="mt-3 space-y-3">
+              <CopyButton state={copyState.diff} label="Copy diff" onClick={() => void copy('diff', remediation.unifiedDiff)} />
+              <pre className="rounded-xl border border-slate-800/80 bg-slate-950 p-4 overflow-x-auto font-mono text-xs leading-relaxed">
+                {remediation.unifiedDiff.split(/\r?\n/).map((line, index) => (
+                  <div
+                    key={index}
+                    className={`px-2 whitespace-pre ${
+                      line.startsWith('+++') || line.startsWith('---')
+                        ? 'text-slate-400'
+                        : line.startsWith('+')
+                          ? 'text-emerald-400 bg-emerald-500/10'
+                          : line.startsWith('-')
+                            ? 'text-rose-400 bg-rose-500/10'
+                            : 'text-cyan-400'
+                    }`}
+                  >
+                    {line}
+                  </div>
+                ))}
               </pre>
             </div>
           )}
         </div>
       </section>
 
-      {/* Right Card: Emergency Incident Checklist */}
-      <section className="bg-slate-900/50 border border-slate-800/60 rounded-2xl p-6 lg:p-8 space-y-6 shadow-xl">
+      <section aria-labelledby="runbook-title" className="bg-slate-900/50 border border-slate-800/60 rounded-2xl p-6 lg:p-8 space-y-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
           <div className="space-y-1.5">
-            <div className="flex items-center gap-2 text-amber-400 text-xs font-bold uppercase tracking-wider">
-              <ListChecks className="w-4 h-4" />
-              Emergency Incident Checklist
-            </div>
-            <h2 className="text-lg font-bold text-slate-100">
-              Step-by-Step Recovery Runbook
-            </h2>
+            <p className="flex items-center gap-2 text-amber-400 text-xs font-bold uppercase tracking-wider">
+              <ListChecks className="w-4 h-4" aria-hidden="true" />
+              Incident checklist
+            </p>
+            <h2 id="runbook-title" className="text-lg font-bold text-slate-100">Step-by-step recovery</h2>
           </div>
-
-          <button
-            type="button"
-            onClick={() => copyText('runbook', remediation.runbookMarkdown)}
-            className="h-10 flex items-center gap-2 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold text-xs transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 active:scale-[0.98] cursor-pointer"
-          >
-            {copiedKey === 'runbook' ? (
-              <>
-                <Check className="w-4 h-4 text-emerald-400" />
-                Copied Markdown!
-              </>
-            ) : (
-              <>
-                <ClipboardCheck className="w-4 h-4 text-cyan-400" />
-                Copy Markdown
-              </>
-            )}
-          </button>
+          <CopyButton state={copyState.runbook} label="Copy Markdown" onClick={() => void copy('runbook', remediation.runbookMarkdown)} />
         </div>
 
-        {/* Progress Bar */}
-        <div className="p-4 rounded-xl bg-slate-950/70 border border-slate-800/60 flex items-center justify-between gap-4">
-          <div className="space-y-1 flex-1">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-medium text-slate-300">Runbook Completion</span>
-              <span className="font-mono tabular-nums font-bold text-emerald-400">
-                {completedCount} of {checklistSteps.length} steps completed
-              </span>
-            </div>
-            <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden">
-              <div
-                className="h-full bg-emerald-500 transition-[width] duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]"
-                style={{
-                  width: `${
-                    checklistSteps.length > 0
-                      ? Math.round((completedCount / checklistSteps.length) * 100)
-                      : 0
-                  }%`,
-                }}
-              />
-            </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-slate-300">Progress</span>
+            <span className="font-mono tabular-nums text-emerald-400">{done} of {steps.length} done</span>
+          </div>
+          <div className="h-2 bg-slate-950 rounded-full overflow-hidden" role="progressbar" aria-valuemin={0} aria-valuemax={steps.length} aria-valuenow={done}>
+            <div
+              className="h-full bg-emerald-500 transition-[width] duration-500 ease-[cubic-bezier(0.16,1,0.3,1)]"
+              style={{ width: `${steps.length ? (done / steps.length) * 100 : 0}%` }}
+            />
           </div>
         </div>
 
-        {/* Interactive Step-by-Step Cards */}
-        <div className="space-y-3">
-          {checklistSteps.map(({ line, index }, stepIdx) => {
-            const text = line.replace('- [ ] ', '');
-            const checked = !!checkedItems[index];
-            return (
+        <ol className="space-y-3">
+          {steps.map(({ line, index }, position) => (
+            <li key={index}>
               <label
-                key={index}
-                className={`flex items-start gap-3.5 p-4 rounded-xl border cursor-pointer transition-all ${
-                  checked
-                    ? 'bg-emerald-500/10 border-emerald-500/30 text-slate-400'
-                    : 'bg-slate-950/70 border-slate-800/60 hover:border-slate-700 text-slate-100'
+                className={`flex items-start gap-3.5 p-4 rounded-xl border cursor-pointer transition-colors ${
+                  checked[index] ? 'bg-emerald-500/10 border-emerald-500/30' : 'bg-slate-950/70 border-slate-800/60 hover:border-slate-700'
                 }`}
               >
                 <input
                   type="checkbox"
-                  checked={checked}
-                  onChange={() =>
-                    setCheckedItems((prev) => ({ ...prev, [index]: !prev[index] }))
-                  }
+                  checked={Boolean(checked[index])}
+                  onChange={() => setChecked((previous) => ({ ...previous, [index]: !previous[index] }))}
                   className="mt-1 w-4 h-4 accent-emerald-400 shrink-0"
                 />
-                <div className="space-y-1 text-sm leading-relaxed">
-                  <span className="text-xs font-mono uppercase tracking-wider text-slate-400 block">
-                    Step {stepIdx + 1}
-                  </span>
-                  <span className={checked ? 'line-through text-slate-500' : 'text-slate-200'}>
-                    {text}
-                  </span>
-                </div>
+                <span className="space-y-1 text-sm leading-relaxed">
+                  <span className="block text-xs font-mono uppercase tracking-wider text-slate-400">Step {position + 1}</span>
+                  <span className={checked[index] ? 'line-through text-slate-500' : 'text-slate-200'}>{line.slice(6)}</span>
+                </span>
               </label>
-            );
-          })}
-        </div>
+            </li>
+          ))}
+        </ol>
       </section>
     </div>
   );

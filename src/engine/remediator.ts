@@ -1,10 +1,10 @@
 /**
- * Incident remediation artifacts.
+ * Trace-driven remediation guidance.
  *
- * This module produces reviewable text rather than mutating source files. The
- * generated patch is intentionally conservative: it states one canonical lock
- * order, and for incidents without mutexes it emits bounded-admission and
- * retry-budget controls instead of pretending that a lock exists.
+ * Everything here is derived from the ingested trace: the offending source lines,
+ * each worker's observed lock acquisition order, and the canonical order that
+ * removes circular waits. The "patched" code is a generated template meant for
+ * human review; this module never reads or modifies the user's source tree.
  */
 
 import type {
@@ -12,480 +12,265 @@ import type {
   LockEvent,
   RaceConflict,
   RemediationPlan,
-  ScenarioPreset,
+  RemediationStrategy,
+  StarvationAlert,
 } from '../shared/types';
 
-export type { RemediationPlan } from '../shared/types';
+export type { RemediationPlan, RemediationStrategy } from '../shared/types';
 
-type RecordLike = { readonly [key: string]: unknown };
-
-export interface CanonicalLockOrderingPatch {
-  readonly scenarioId: string;
-  readonly scenarioName: string;
-  readonly incidentKind: string;
-  /** Sorted, stable order of the locks used by the patch. */
-  readonly canonicalLockOrder: readonly string[];
-  readonly canonicalOrder: readonly string[];
-  readonly lockOrder: readonly string[];
-  /** Safe phases for pool-starvation/retry-storm scenarios. */
-  readonly safeControlOrder: readonly string[];
-  readonly hasLocks: boolean;
-  readonly strategy: string;
-  readonly rationale: string;
-  readonly brokenCode: string;
-  readonly patchedCode: string;
-  readonly unifiedDiff: string;
-  readonly patchText: string;
-  readonly patch: string;
-  readonly diff: string;
-  readonly diffText: string;
-}
-
-export interface RemediationResult extends CanonicalLockOrderingPatch {
-  /** Markdown headed exactly as a 3 a.m. operator checklist. */
-  readonly runbook: string;
-  readonly runbookMarkdown: string;
-  readonly runbookText: string;
-  readonly markdown: string;
-  readonly checklist: string;
-}
-
-export type RemediationScenario = unknown;
-
-function isRecord(value: unknown): value is RecordLike {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function normalizeKey(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
-}
-
-function stringValue(value: unknown): string | undefined {
-  if (typeof value === 'string' && value.trim().length > 0) return value.trim();
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-  return undefined;
-}
-
-function directValue(record: RecordLike, aliases: readonly string[]): unknown {
-  const keys = new Map(Object.keys(record).map((key) => [normalizeKey(key), key]));
-  for (const alias of aliases) {
-    const key = keys.get(normalizeKey(alias));
-    if (key !== undefined && record[key] !== undefined) return record[key];
-  }
-  return undefined;
-}
-
-function collectRecords(root: unknown): RecordLike[] {
-  const records: RecordLike[] = [];
-  const visited = new Set<object>();
-  const visit = (value: unknown, depth: number): void => {
-    if (!isRecord(value) || visited.has(value) || depth > 6) return;
-    visited.add(value);
-    records.push(value);
-    for (const key of Object.keys(value).sort()) {
-      const child = value[key];
-      if (isRecord(child)) visit(child, depth + 1);
-    }
-  };
-  visit(root, 0);
-  return records;
-}
-
-function findValue(root: unknown, aliases: readonly string[]): unknown {
-  for (const record of collectRecords(root)) {
-    const value = directValue(record, aliases);
-    if (value !== undefined) return value;
-  }
-  return undefined;
-}
-
-function findString(root: unknown, aliases: readonly string[]): string | undefined {
-  return stringValue(findValue(root, aliases));
+export interface RemediationInput {
+  readonly events: readonly LockEvent[];
+  readonly cycles?: readonly DeadlockCycle[];
+  readonly races?: readonly RaceConflict[];
+  readonly starvation?: readonly Pick<StarvationAlert, 'resourceId'>[];
+  /** Optional user-supplied source excerpt shown as the "before" side of the diff. */
+  readonly sourceCode?: string;
 }
 
 function compareStrings(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function uniqueSorted(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim().length > 0))].sort(compareStrings);
-}
-
-function uniqueInOrder(values: readonly string[]): string[] {
-  return [...new Set(values.filter((value) => value.trim().length > 0))];
-}
-
-function lockName(value: unknown): string | undefined {
-  const direct = stringValue(value);
-  if (direct !== undefined) return direct;
-  if (!isRecord(value)) return undefined;
-  for (const key of ['id', 'name', 'lockId', 'resourceId', 'key', 'label']) {
-    const nested = stringValue(directValue(value, [key]));
-    if (nested !== undefined) return nested;
-  }
-  return undefined;
-}
-
-interface LockDescriptor {
-  readonly name: string;
-  readonly order?: number;
-}
-
-function lockDescriptors(values: readonly unknown[]): LockDescriptor[] {
-  return values
-    .map((value): LockDescriptor | undefined => {
-      const name = lockName(value);
-      if (name === undefined) return undefined;
-      if (!isRecord(value)) return { name };
-      const orderValue = directValue(value, ['order', 'rank', 'sequence', 'index', 'priority']);
-      return {
-        name,
-        order: typeof orderValue === 'number' && Number.isFinite(orderValue) ? orderValue : undefined,
-      };
-    })
-    .filter((descriptor): descriptor is LockDescriptor => descriptor !== undefined);
-}
-
-function extractLocks(scenario: unknown): string[] {
-  const explicit = findValue(scenario, [
-    'canonicalLockOrder',
-    'canonicalOrder',
-    'lockOrder',
-    'lockNames',
-    'locks',
-    'lockResources',
-    'mutexes',
-  ]);
-  if (Array.isArray(explicit)) {
-    const descriptors = lockDescriptors(explicit);
-    descriptors.sort(
-      (left, right) =>
-      (left.order === undefined ? Number.POSITIVE_INFINITY : left.order) -
-          (right.order === undefined ? Number.POSITIVE_INFINITY : right.order) ||
-        compareStrings(left.name, right.name),
-    );
-    return uniqueInOrder(descriptors.map((descriptor) => descriptor.name));
-  }
-
-  const categoryText = ['id', 'name', 'title', 'type', 'kind', 'category']
-    .map((key) => findString(scenario, [key]) ?? '')
-    .join(' ')
-    .toLowerCase();
-  const contentionMode = findString(scenario, ['mode'])?.toLowerCase();
-  if (
-    categoryText.includes('deadlock') ||
-    contentionMode === 'ordered-locks' ||
-    contentionMode === 'circular-rpc'
-  ) {
-    const resourceOrder = findValue(scenario, ['resourceOrder']);
-    if (Array.isArray(resourceOrder)) {
-      const ordered = resourceOrder
-        .map(lockName)
-        .filter((value): value is string => value !== undefined);
-      if (ordered.length > 0) return uniqueInOrder(ordered);
-    }
-  }
-
-  const resources = findValue(scenario, ['resources', 'resourceNodes']);
-  if (Array.isArray(resources)) {
-    const descriptors = lockDescriptors(
-      resources.filter((resource) => {
-        if (!isRecord(resource)) return false;
-        const kind = stringValue(directValue(resource, ['kind', 'type', 'category']))?.toLowerCase() ?? '';
-        return kind.includes('lock') || kind.includes('mutex');
-      }),
-    );
-    if (descriptors.length > 0) return uniqueSorted(descriptors.map((descriptor) => descriptor.name));
-  }
-
-  return [];
-}
-
-function incidentId(scenario: unknown): string {
-  return findString(scenario, ['id', 'scenarioId', 'key', 'slug']) ??
-    findString(scenario, ['name', 'title']) ??
-    'incident-scenario';
-}
-
-function incidentName(scenario: unknown, id: string): string {
-  return findString(scenario, ['name', 'title', 'label']) ?? id;
-}
-
-function incidentKind(scenario: unknown, hasLocks: boolean): string {
-  const text = ['id', 'name', 'title', 'type', 'kind', 'category', 'description']
-    .map((key) => findString(scenario, [key]) ?? '')
-    .join(' ')
-    .toLowerCase();
-  if (text.includes('pool') || text.includes('starvation')) return 'pool-starvation';
-  if (text.includes('retry') || text.includes('storm')) return 'retry-storm';
-  if (text.includes('deadlock') || text.includes('lock') || hasLocks) return 'deadlock';
-  return 'contention';
-}
-
 function quote(value: string): string {
   return JSON.stringify(value);
 }
 
-function sourceFile(scenario: unknown): string {
-  return findString(scenario, [
-    'lockFile',
-    'sourceFile',
-    'file',
-    'implementationFile',
-  ]) ?? 'src/concurrency/locks.ts';
+function sortedByTime(events: readonly LockEvent[]): LockEvent[] {
+  return events
+    .map((event, index) => ({ event, index }))
+    .sort((left, right) => left.event.timestamp - right.event.timestamp || left.index - right.index)
+    .map(({ event }) => event);
 }
 
-function lockPatch(
-  scenario: unknown,
-  id: string,
-  name: string,
-  locks: readonly string[],
-): { readonly patchText: string; readonly rationale: string; readonly strategy: string } {
-  const file = sourceFile(scenario);
-  const list = locks.map(quote).join(', ');
-  const rationale =
-    `Every multi-lock request in ${name} must acquire resources in one canonical order ` +
-    `(${locks.join(' → ')}). Sorting acquisition plans before the first acquire removes ` +
-    `the circular wait edge while preserving the request's work. Releases remain reverse-order.`;
-  const patchText = [
-    `--- a/${file}`,
-    `+++ b/${file}`,
-    '@@',
-    '- // Acquire locks in the order requested by each worker.',
-    '- await acquireAll(request.lockIds);',
-    '+ // DeadlockZero canonical ordering; never acquire in request-dependent order.',
-    `+ const CANONICAL_LOCK_ORDER = [${list}] as const;`,
-    '+ const orderedLocks = sortByCanonicalOrder(request.lockIds, CANONICAL_LOCK_ORDER);',
-    '+ await acquireAll(orderedLocks);',
-    '+ // Release in reverse acquisition order, even when the handler fails.',
-    '+ try {',
-    '+   return await handleWithLocks(request);',
-    '+ } finally {',
-    '+   await releaseAll([...orderedLocks].reverse());',
-    '+ }',
-    '',
-    `// Scenario: ${id}`,
-  ].join('\n');
-  return {
-    patchText,
-    rationale,
-    strategy: 'canonical-lock-order',
-  };
+/** Each worker's lock acquisition order as observed in the trace (ACQUIRE and WAIT). */
+export function observedLockOrders(events: readonly LockEvent[]): Map<string, string[]> {
+  const orders = new Map<string, string[]>();
+  for (const event of sortedByTime(events)) {
+    if (event.action !== 'ACQUIRE' && event.action !== 'WAIT') continue;
+    const order = orders.get(event.workerId) ?? [];
+    if (!order.includes(event.resourceId)) order.push(event.resourceId);
+    orders.set(event.workerId, order);
+  }
+  return orders;
 }
 
-function controlPatch(
-  scenario: unknown,
-  id: string,
-  name: string,
-): { readonly patchText: string; readonly rationale: string; readonly strategy: string } {
-  const file = sourceFile(scenario) === 'src/concurrency/locks.ts'
-    ? 'src/concurrency/admission.ts'
-    : sourceFile(scenario);
-  const rationale =
-    `No mutex resources were declared for ${name}, so a lock-order patch would be misleading. ` +
-    'Apply a safe control order instead: admit a bounded number of requests, acquire a pool ' +
-    'resource, perform work, release it, then spend a finite retry budget with exponential ' +
-    'backoff and jitter. Never hold a connection while sleeping or retrying.';
-  const patchText = [
-    `--- a/${file}`,
-    `+++ b/${file}`,
-    '@@',
-    '+ const admission = createBoundedAdmission({ maxInFlight: pool.capacity });',
-    '+ const retryBudget = createRetryBudget({ maxAttempts: 3, maxElapsedMs: 2_000 });',
-    '+ return admission.run(async () => {',
-    '+   const connection = await pool.acquire();',
-    '+   try {',
-    '+     return await retryBudget.run(() => performWork(connection));',
-    '+   } finally {',
-    '+     connection.release();',
-    '+   }',
-    '+ });',
-    '+ // Back off with bounded jitter; do not retry immediately on every worker.',
-    '',
-    `// Scenario: ${id}`,
-  ].join('\n');
-  return {
-    patchText,
-    rationale,
-    strategy: 'bounded-admission-then-resource-then-finite-retry-budget',
-  };
+function lockResources(events: readonly LockEvent[]): string[] {
+  return [
+    ...new Set(
+      events
+        .filter((event) => event.action === 'ACQUIRE' || event.action === 'WAIT')
+        .map((event) => event.resourceId),
+    ),
+  ].sort(compareStrings);
 }
 
-function buildUnifiedDiffFromCode(
-  file: string,
-  brokenCode: string,
-  patchedCode: string,
-  fallbackDiff: string,
+function chooseStrategy(input: RemediationInput): RemediationStrategy {
+  if ((input.cycles?.length ?? 0) > 0) return 'canonical-lock-order';
+  if ((input.races?.length ?? 0) > 0) return 'guard-shared-state';
+  if ((input.starvation?.length ?? 0) > 0) return 'shorten-lock-hold-time';
+  return 'none-required';
+}
+
+/** Events whose source lines are implicated by the findings, in trace order. */
+function implicatedEvents(input: RemediationInput, strategy: RemediationStrategy): LockEvent[] {
+  const events = sortedByTime(input.events);
+  if (strategy === 'canonical-lock-order') {
+    const members = new Set((input.cycles ?? []).flatMap((cycle) => cycle.cycleNodes));
+    return events.filter(
+      (event) =>
+        (event.action === 'ACQUIRE' || event.action === 'WAIT') &&
+        members.has(event.workerId) &&
+        members.has(event.resourceId),
+    );
+  }
+  if (strategy === 'guard-shared-state') {
+    const resources = new Set((input.races ?? []).map((race) => race.resourceId));
+    return events.filter(
+      (event) => (event.action === 'READ' || event.action === 'WRITE') && resources.has(event.resourceId),
+    );
+  }
+  if (strategy === 'shorten-lock-hold-time') {
+    const resources = new Set((input.starvation ?? []).map((alert) => alert.resourceId));
+    return events.filter((event) => resources.has(event.resourceId));
+  }
+  return events.filter((event) => event.action === 'ACQUIRE' || event.action === 'WAIT');
+}
+
+function excerptFromEvents(events: readonly LockEvent[]): string {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const event of events) {
+    const key = `${event.file}:${event.line}:${event.workerId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(`// ${event.file}:${event.line} (${event.workerId} ${event.action} ${event.resourceId})`);
+    lines.push(event.codeSnippet);
+  }
+  return lines.join('\n');
+}
+
+function patchedTemplate(
+  strategy: RemediationStrategy,
+  order: readonly string[],
+  observed: ReadonlyMap<string, string[]>,
+  guarded: readonly string[],
+  starved: readonly string[],
 ): string {
-  const brokenLines = brokenCode.split(/\r?\n/).map((line) => `- ${line}`);
-  const patchedLines = patchedCode.split(/\r?\n/).map((line) => `+ ${line}`);
+  if (strategy === 'canonical-lock-order') {
+    const lines = [
+      '// Generated suggestion: acquire every lock set in one global order.',
+      `const LOCK_ORDER = [${order.map(quote).join(', ')}] as const;`,
+      '',
+    ];
+    for (const [workerId, locks] of [...observed].sort(([left], [right]) => compareStrings(left, right))) {
+      const sorted = [...locks].sort((left, right) => order.indexOf(left) - order.indexOf(right));
+      const changed = sorted.some((lock, index) => lock !== locks[index]);
+      lines.push(
+        `// ${workerId}: observed ${locks.join(' -> ')}${changed ? ` ; must become ${sorted.join(' -> ')}` : ' (already canonical)'}`,
+      );
+    }
+    lines.push(
+      '',
+      'const ordered = [...requestedLocks].sort((a, b) => LOCK_ORDER.indexOf(a) - LOCK_ORDER.indexOf(b));',
+      'for (const lock of ordered) await acquire(lock);',
+      'try {',
+      '  // critical section',
+      '} finally {',
+      '  for (const lock of [...ordered].reverse()) await release(lock);',
+      '}',
+    );
+    return lines.join('\n');
+  }
+  if (strategy === 'guard-shared-state') {
+    return [
+      '// Generated suggestion: make each read-modify-write atomic under one lock per resource.',
+      `// Unsynchronized resources found in the trace: ${guarded.join(', ')}`,
+      'await withLock(`guard:${resourceId}`, async () => {',
+      '  const { value, version } = await store.readVersioned(resourceId);',
+      '  await store.compareAndSwap(resourceId, nextValue(value), version);',
+      '});',
+    ].join('\n');
+  }
+  if (strategy === 'shorten-lock-hold-time') {
+    return [
+      `// Generated suggestion: most workers are blocked on ${starved.join(', ')}.`,
+      '// Hold the resource only for the critical section and never across external I/O.',
+      'const resource = await pool.acquire({ timeoutMs: ACQUIRE_TIMEOUT_MS });',
+      'try {',
+      '  await doCriticalWork(resource);',
+      '} finally {',
+      '  resource.release();',
+      '}',
+      'await callExternalService(); // after release',
+    ].join('\n');
+  }
+  return [
+    '// No deadlock cycle, race, or starvation was detected in this trace.',
+    `// Keep acquiring locks in this order to stay cycle-free: ${order.join(' -> ') || '(no locks)'}`,
+  ].join('\n');
+}
+
+/** Build a well-formed unified diff that replaces `before` with `after`. */
+export function buildUnifiedDiff(file: string, before: string, after: string): string {
+  const removed = before.split(/\r?\n/);
+  const added = after.split(/\r?\n/);
   return [
     `--- a/${file}`,
     `+++ b/${file}`,
-    '@@ -1 +1 @@',
-    ...brokenLines,
-    ...patchedLines,
-    '',
-    fallbackDiff,
+    `@@ -1,${removed.length} +1,${added.length} @@`,
+    ...removed.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
   ].join('\n');
 }
 
-/**
- * Generate a deterministic patch proposal. No files are changed by this
- * function; callers can display or review `patchText`/`diffText` first.
- */
-export function generateCanonicalLockOrderingPatch(
-  scenario: RemediationScenario,
-): CanonicalLockOrderingPatch {
-  const id = incidentId(scenario);
-  const name = incidentName(scenario, id);
-  const locks = extractLocks(scenario);
-  const hasLocks = locks.length > 0;
-  const kind = incidentKind(scenario, hasLocks);
-  const generated = hasLocks
-    ? lockPatch(scenario, id, name, locks)
-    : controlPatch(scenario, id, name);
-  const safeControlOrder = hasLocks
-    ? [...locks]
-    : ['admission-gate', 'resource-acquisition', 'work', 'resource-release', 'retry-budget'];
-  const file = sourceFile(scenario);
-  const defaultBroken = [
-    `// ${file} (BROKEN: non-canonical lock / resource acquisition)`,
-    'await acquireInRequestOrder(request.resources);',
-  ].join('\n');
-  const defaultPatched = [
-    `// ${file} (PATCHED: DeadlockZero canonical lock ordering)`,
-    `const CANONICAL_LOCK_ORDER = [${locks.map(quote).join(', ')}] as const;`,
-    'await acquireAll(sortByCanonicalOrder(request.resources, CANONICAL_LOCK_ORDER));',
-  ].join('\n');
-  const brokenCode = findString(scenario, ['brokenCode']) ?? defaultBroken;
-  const patchedCode = findString(scenario, ['patchedCode']) ?? defaultPatched;
-  const unifiedDiff = buildUnifiedDiffFromCode(file, brokenCode, patchedCode, generated.patchText);
+function rationaleFor(strategy: RemediationStrategy, order: readonly string[], input: RemediationInput): string {
+  switch (strategy) {
+    case 'canonical-lock-order':
+      return (
+        `${input.cycles?.length ?? 0} wait-for cycle(s) exist because workers acquire the same locks in different orders. ` +
+        `If every worker acquires locks in the single order ${order.join(' -> ')}, no circular wait can form.`
+      );
+    case 'guard-shared-state':
+      return (
+        `${input.races?.length ?? 0} pair(s) of conflicting accesses have concurrent vector clocks and no common lock. ` +
+        'Serializing each read-modify-write under a per-resource lock (or a versioned compare-and-swap) removes the race.'
+      );
+    case 'shorten-lock-hold-time':
+      return (
+        'More than 80% of workers are blocked waiting on the same resource. Lock ordering cannot fix this; ' +
+        'shorten how long the resource is held and bound how long callers wait for it.'
+      );
+    default:
+      return 'No concurrency defect was detected in this trace. The canonical order is listed for reference.';
+  }
+}
 
-  return {
-    scenarioId: id,
-    scenarioName: name,
-    incidentKind: kind,
-    canonicalLockOrder: [...locks],
-    canonicalOrder: [...locks],
-    lockOrder: [...locks],
-    safeControlOrder,
-    hasLocks,
-    strategy: generated.strategy,
-    rationale: generated.rationale,
-    brokenCode,
-    patchedCode,
-    unifiedDiff,
-    patchText: unifiedDiff,
-    patch: unifiedDiff,
-    diff: unifiedDiff,
-    diffText: unifiedDiff,
+function runbookFor(strategy: RemediationStrategy, order: readonly string[], sourceFile: string): string {
+  const specific: Record<RemediationStrategy, string[]> = {
+    'canonical-lock-order': [
+      `- [ ] Confirm every code path that takes these locks uses the order: ${order.join(' -> ')}.`,
+      '- [ ] As a stopgap, set a lock wait timeout so blocked requests fail fast instead of hanging.',
+      '- [ ] Re-capture a trace after the fix and verify DeadlockZero reports zero cycles.',
+    ],
+    'guard-shared-state': [
+      '- [ ] Identify every writer of the affected resources and wrap the read-modify-write in one lock or CAS.',
+      '- [ ] Check for corrupted or lost updates written while the race was live and plan a data repair.',
+      '- [ ] Re-capture a trace after the fix and verify DeadlockZero reports zero races.',
+    ],
+    'shorten-lock-hold-time': [
+      '- [ ] Find code that holds the resource across network calls, sleeps, or retries.',
+      '- [ ] Add acquire timeouts and alert on pool wait time and queue depth.',
+      '- [ ] Re-capture a trace and verify fewer than 80% of workers are blocked on one resource.',
+    ],
+    'none-required': [
+      '- [ ] No action required for this trace. Keep the lock order documented for future changes.',
+    ],
   };
-}
-
-/**
- * Produce the operator-facing checklist for a live incident. The wording is
- * stable so it can be snapshot-tested and pasted into an incident channel.
- */
-export function generateOutageRunbook(
-  scenario: RemediationScenario,
-  patch?: CanonicalLockOrderingPatch,
-): string {
-  const generated = patch ?? generateCanonicalLockOrderingPatch(scenario);
-  const kind = generated.incidentKind;
-  const controlLine = generated.hasLocks
-    ? `- [ ] Confirm every code path uses the canonical order: ${generated.canonicalLockOrder.join(' → ')}.`
-    : '- [ ] Enable bounded admission, finite retry budgets, exponential backoff with jitter, and a circuit breaker; never sleep while holding a pool resource.';
-  const verification = generated.hasLocks
-    ? '- [ ] Re-capture the wait-for graph and verify the cycle count is zero.'
-    : '- [ ] Re-check pool utilization, queue depth, retry rate, and circuit-breaker state; verify queue depth is draining.';
   return [
-    '# 3 a.m. Outage Runbook Checklist',
+    '# Incident Runbook Checklist',
     '',
-    `Incident: **${generated.scenarioName}** (${kind})`,
+    `Strategy: **${strategy}** (primary file: \`${sourceFile}\`)`,
     '',
     '## Stabilize',
-    '- [ ] Declare the incident, assign an incident commander, and record the start time.',
-    '- [ ] Freeze unrelated deploys and capture logs, traces, worker count, queue depth, and error rate.',
-    '- [ ] Stop the retry amplification path or enable the existing traffic shedder before changing code.',
-    controlLine,
+    '- [ ] Declare the incident, assign an owner, and record the start time.',
+    '- [ ] Capture logs, the lock trace, worker count, queue depth, and error rate before restarting anything.',
     '',
-    '## Patch and verify',
-    `- [ ] Review the generated ${generated.strategy} patch and confirm the target file is correct.`,
-    '- [ ] Run the deterministic simulator before and after the patch; record completed, dropped, deadlock, throughput, and p50/p95/p99 latency metrics.',
-    '- [ ] Deploy to one canary worker or shard and watch error rate, saturation, and latency for one full request window.',
-    verification,
-    '- [ ] Roll out gradually; pause or roll back if any saturation or error budget signal regresses.',
+    '## Fix and verify',
+    ...specific[strategy],
+    '- [ ] Review the generated patch suggestion; it is a template, not a tested change to your code.',
+    '- [ ] Canary the change on one instance and watch error rate, saturation, and latency.',
     '',
-    '## Recover and close',
-    '- [ ] Drain queued work deliberately; do not release a retry storm all at once.',
-    '- [ ] Confirm successful requests and user-visible recovery across the affected dependency.',
-    '- [ ] Remove temporary traffic limits only after the queue and retry rate return to baseline.',
-    '- [ ] Preserve the graph, logs, simulator results, and patch review for the post-incident review.',
-    '- [ ] File follow-up work for regression coverage, alerting, and a permanent runbook owner.',
-    '',
-    '## Rollback',
-    '- [ ] If the canary regresses, stop rollout, restore the last known-good build, and keep admission/retry controls enabled.',
-    '- [ ] Re-check the original failure mode before declaring the incident resolved.',
+    '## Close',
+    '- [ ] Add a regression test that reproduces the trace.',
+    '- [ ] Record the root cause and the trace in the post-incident review.',
     '',
   ].join('\n');
 }
 
-export const generateRunbook = generateOutageRunbook;
-export const generateRunbookChecklist = generateOutageRunbook;
-export const generateLockOrderingPatch = generateCanonicalLockOrderingPatch;
-
-/** Generate all remediation artifacts in one deterministic value. */
-export function remediateScenario(scenario: RemediationScenario): RemediationResult {
-  const patch = generateCanonicalLockOrderingPatch(scenario);
-  const runbook = generateOutageRunbook(scenario, patch);
+/** Generate remediation guidance for an analyzed trace. */
+export function generateRemediationPlan(input: RemediationInput): RemediationPlan {
+  const strategy = chooseStrategy(input);
+  const canonicalLockOrder = lockResources(input.events);
+  const implicated = implicatedEvents(input, strategy);
+  const sourceFile = implicated[0]?.file ?? input.events[0]?.file ?? 'trace';
+  const brokenCode =
+    input.sourceCode?.trim() ? input.sourceCode : excerptFromEvents(implicated.length > 0 ? implicated : input.events);
+  const patchedCode = patchedTemplate(
+    strategy,
+    canonicalLockOrder,
+    observedLockOrders(input.events),
+    [...new Set((input.races ?? []).map((race) => race.resourceId))].sort(compareStrings),
+    [...new Set((input.starvation ?? []).map((alert) => alert.resourceId))].sort(compareStrings),
+  );
   return {
-    ...patch,
-    runbook,
-    runbookMarkdown: runbook,
-    checklist: runbook,
-    runbookText: runbook,
-    markdown: runbook,
+    strategy,
+    rationale: rationaleFor(strategy, canonicalLockOrder, input),
+    canonicalLockOrder,
+    sourceFile,
+    brokenCode,
+    patchedCode,
+    unifiedDiff: buildUnifiedDiff(sourceFile, brokenCode, patchedCode),
+    runbookMarkdown: runbookFor(strategy, canonicalLockOrder, sourceFile),
+    generated: true,
   };
-}
-
-export const generateRemediation = remediateScenario;
-export const buildRemediation = remediateScenario;
-export const generatePatch = generateCanonicalLockOrderingPatch;
-
-/**
- * Generate a complete RemediationPlan from a scenario preset, custom LockEvent[],
- * or detected DeadlockCycle[] / RaceConflict[] findings.
- */
-export function generateRemediationPlan(
-  input?: ScenarioPreset | readonly LockEvent[] | unknown,
-  cycles: readonly DeadlockCycle[] = [],
-  races: readonly RaceConflict[] = [],
-): RemediationResult {
-  if (Array.isArray(input)) {
-    const events = input as readonly LockEvent[];
-    const resources = uniqueSorted(
-      events
-        .map((e) => e.resourceId)
-        .filter((r): r is string => typeof r === 'string' && r.length > 0),
-    );
-    const firstFile = events.find((e) => typeof e.file === 'string')?.file ?? 'src/services/ledger.ts';
-    const syntheticScenario = {
-      id: 'custom-trace-remediation',
-      title: 'Custom Lock Trace Analysis',
-      category: cycles.length > 0 ? 'deadlock' : races.length > 0 ? 'data-race' : 'contention',
-      sourceFile: firstFile,
-      locks: resources,
-      resourceOrder: resources,
-      brokenCode: events.map((e) => `// ${e.file}:${e.line}\n${e.codeSnippet}`).join('\n'),
-      patchedCode: [
-        `// ${firstFile} (PATCHED: DeadlockZero canonical total lock order)`,
-        `const CANONICAL_LOCK_ORDER = [${resources.map(quote).join(', ')}] as const;`,
-        'const orderedLocks = [...requestedLocks].sort();',
-        'await acquireLocksInOrder(orderedLocks);',
-      ].join('\n'),
-    };
-    return remediateScenario(syntheticScenario);
-  }
-  return remediateScenario(input ?? {});
 }

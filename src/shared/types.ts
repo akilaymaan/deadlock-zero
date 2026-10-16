@@ -1,5 +1,7 @@
 export type LockAction = 'ACQUIRE' | 'WAIT' | 'RELEASE' | 'READ' | 'WRITE';
 
+export const LOCK_ACTIONS: readonly LockAction[] = ['ACQUIRE', 'WAIT', 'RELEASE', 'READ', 'WRITE'];
+
 export interface LockEvent {
   id: string;
   workerId: string;
@@ -69,40 +71,68 @@ export interface StarvationAlert {
   explanation: string;
 }
 
-export interface SimulationMetrics {
+/** Parameters of one virtual-time simulation run. All durations are virtual milliseconds. */
+export interface SimulationConfig {
   workers: number;
+  requestsPerWorker: number;
+  seed: number;
+  lockTimeoutMs: number;
+  deadlockDetectionMs: number;
+  workMs: number;
+  maxVirtualMs: number;
+}
+
+export interface SimulationMetrics {
+  /** True when the run hit its virtual-time or CPU budget before every request finished. */
+  truncated: boolean;
+  workers: number;
+  totalRequests: number;
+  completedRequests: number;
+  failedRequests: number;
+  /** Deadlock cycles detected and broken by aborting a victim request. */
   deadlocksTriggered: number;
+  /** Unsynchronized conflicting accesses (at least one write) between in-flight requests. */
   raceConditionsTriggered: number;
+  lockTimeouts: number;
+  /** Requests still in flight when the virtual time budget ran out. */
+  unfinishedRequests: number;
   throughputReqPerSec: number;
   p50Ms: number;
   p95Ms: number;
   p99Ms: number;
   successRatePct: number;
+  virtualDurationMs: number;
 }
 
 export interface ChaosBenchmarkResult {
+  config: SimulationConfig;
+  canonicalLockOrder: string[];
   before: SimulationMetrics;
   after: SimulationMetrics;
-  improvementFactor: number;
+  /** after.throughput / before.throughput, or null when the unpatched run completed nothing. */
+  improvementFactor: number | null;
 }
 
+export type RemediationStrategy =
+  | 'canonical-lock-order'
+  | 'guard-shared-state'
+  | 'shorten-lock-hold-time'
+  | 'none-required';
+
+/**
+ * Generated remediation guidance. `patchedCode` is a suggested template derived from the
+ * trace, not a verified patch of the user's real source tree.
+ */
 export interface RemediationPlan {
-  strategy: string;
+  strategy: RemediationStrategy;
+  rationale: string;
+  canonicalLockOrder: string[];
+  sourceFile: string;
   brokenCode: string;
   patchedCode: string;
   unifiedDiff: string;
   runbookMarkdown: string;
-}
-
-export interface ScenarioPreset {
-  id: string;
-  title: string;
-  category: string;
-  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM';
-  description: string;
-  events: LockEvent[];
-  brokenCode: string;
-  patchedCode: string;
+  generated: true;
 }
 
 export interface WaitForAdjacencyHop {

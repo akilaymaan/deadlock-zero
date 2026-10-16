@@ -1,5 +1,5 @@
 import type { SourceCodeReference } from './graph';
-import type { LockEvent, RaceConflict, StarvationAlert } from '../shared/types';
+import type { LockEvent, RaceConflict } from '../shared/types';
 
 export type { SourceCodeReference } from './graph';
 export type { RaceConflict, StarvationAlert } from '../shared/types';

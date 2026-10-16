@@ -1,28 +1,27 @@
 {
   "name": "deadlockzero",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
     "dev": "vite",
-    "dev:server": "tsx src/server/index.ts",
-    "build:backend": "tsc --noEmit",
-    "build:frontend": "vite build",
-    "build": "npm run build:backend && npm run build:frontend",
-    "start": "tsx src/server/index.ts",
+    "dev:server": "tsx watch src/server/index.ts",
+    "build": "npm run clean && npm run typecheck && npm run build:client && npm run build:server",
+    "start": "node dist/server/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "preview": "vite preview"
+    "typecheck": "tsc --noEmit",
+    "build:client": "vite build",
+    "build:server": "vite build --ssr src/server/index.ts",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },
   "dependencies": {
     "cors": "^2.8.6",
-    "express": "^5.3.0",
-    "lucide-react": "^1.58.0",
-    "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "express": "^5.3.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",
@@ -33,13 +32,16 @@
     "@types/react-dom": "^19.1.0",
     "@types/supertest": "^7.2.1",
     "@vitejs/plugin-react": "^4.4.1",
-    "autoprefixer": "^10.6.1",
-    "postcss": "^8.5.30",
+    "lucide-react": "^1.58.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "supertest": "^7.3.1",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.19.3",
     "typescript": "^5.8.3",
     "vite": "^6.3.5",
-    "vitest": "^3.1.2"
-  }
+    "vitest": "^4.1.11"
+  },
+  "license": "MIT",
+  "description": "Lock-trace forensics: wait-for graphs, Tarjan SCC deadlock detection, vector-clock race detection, and remediation guidance."
 }

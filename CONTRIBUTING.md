@@ -1,73 +1,59 @@
 # Contributing to DeadlockZero
 
-Thank you for contributing to **DeadlockZero**! This guide covers local development setup, running the offline verification suite, and the `LockEvent` trace ingestion schema.
+Thanks for helping. This guide covers setup, conventions, and what a pull request needs to be merged. By participating you agree to the [Code of Conduct](./CODE_OF_CONDUCT.md).
 
----
+## Setup
 
-## Local Development Setup
-
-### Prerequisites
-- **Node.js**: `22.19.0` (pinned in `.nvmrc`; `package.json` enforces `"node": ">=22.0.0"`)
-- **npm**: v10+
-
-### Install & Run
+- Node.js 22 (`.nvmrc` pins `22.19.0`; `nvm use` picks it up) and npm.
 
 ```bash
-cp .env.example .env
 npm ci
-npm run build
-npm start
+npm run dev:server   # API on http://localhost:3000 (reloads on change)
+npm run dev          # UI on http://localhost:5173 (proxies /api)
 ```
 
-For hot-reload development across the React frontend and Express API:
+No database, API keys, or external services are needed.
+
+## Project layout
+
+| Path | Contents |
+| --- | --- |
+| `src/shared/` | Types and trace validation used by both the browser and the server |
+| `src/engine/` | Pure analysis: graph, detectors, remediation, simulator. No I/O. |
+| `src/server/` | Express app, configuration, logging, entry point |
+| `src/client/` | React UI; `lib/` holds DOM-free logic that is unit tested |
+| `tests/` | Vitest suites; `tests/fixtures/traces.ts` holds test-only traces |
+
+Keep `src/engine` free of Node- or browser-specific APIs; it runs in both.
+
+## Workflow
+
+1. Open an issue first for anything beyond a small fix, so the approach can be agreed.
+2. Branch from `main` using a descriptive name: `fix/<short-description>`, `feat/<short-description>`, `docs/<short-description>`.
+3. Write commits in [Conventional Commits](https://www.conventionalcommits.org/) style (`feat(engine): ...`, `fix(server): ...`, `docs: ...`), as the existing history does.
+4. Before pushing, run:
 
 ```bash
-# Terminal 1: Express API server on port 3000
-npm run dev:server
-
-# Terminal 2: Vite frontend dev server on port 5173 (proxies /api -> localhost:3000)
-npm run dev
-```
-
----
-
-## Running Tests
-
-All unit, graph, detector, simulator, API integration, and repository hygiene tests run 100% offline with a single command:
-
-```bash
+npm run typecheck
 npm test
-```
-
-TypeScript typechecking and production bundle verification:
-
-```bash
 npm run build
 ```
 
----
+CI runs the same commands plus a production dependency audit on every push and pull request.
 
-## `LockEvent` Ingestion Schema
+## Coding standards
 
-DeadlockZero ingests arrays of `LockEvent` objects (via `.json` / `.jsonl` file upload, the UI Trace Editor, or `POST /api/analyze` and `POST /api/benchmark`):
+- TypeScript `strict` with no unused locals or parameters. Avoid `any`; validate untrusted input at the boundary (`src/shared/traceValidation.ts`).
+- No demo data, mock fallbacks, or fabricated metrics in `src/`. If something cannot be computed, return an explicit error. The repository hygiene test enforces part of this.
+- Results must be deterministic for a given input; seed any randomness.
+- Never log request bodies or trace contents.
+- Add or update tests for every behavior change. Engine changes need unit tests; API changes need integration tests in `tests/api.test.ts`.
+- Update `README.md` when you change the trace format, API, configuration, or commands, and add an entry under `[Unreleased]` in `CHANGELOG.md`.
 
-```ts
-export type LockAction = 'ACQUIRE' | 'WAIT' | 'RELEASE' | 'READ' | 'WRITE';
+## Pull requests
 
-export interface LockEvent {
-  id: string;
-  workerId: string;
-  resourceId: string;
-  action: LockAction;
-  timestamp: number;
-  vectorClock: Record<string, number>;
-  file: string;
-  line: number;
-  codeSnippet: string;
-}
-```
+Fill in the pull request template. A PR is ready to merge when CI is green, it has tests, docs are updated, and a maintainer has approved it.
 
-### Pull Request Checklist
-1. Ensure `npm test` and `npm run build` pass with zero errors.
-2. Add or update unit/API tests in `tests/` for new detection or remediation capabilities.
-3. Never commit secrets, API tokens, or hardcoded host filesystem paths.
+## Reporting bugs and security issues
+
+Use the bug report template for bugs, and include a minimal trace that reproduces the problem (remove anything sensitive first). Report vulnerabilities privately as described in [SECURITY.md](./SECURITY.md), not in public issues.
